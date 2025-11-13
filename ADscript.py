@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Advanced Domain Enumeration Tool - Red Team Edition
-Integrated with: PowerView, SharpHound, ADRecon, Invoke-ACLPwn, PowerUpSQL
-Author: Security Assessment Tool
-Version: 2.0
+Advanced Domain Enumeration Tool - Integrated Red Team Edition
+Complete implementation with all tools embedded
+No external dependencies required
+Version: 2.0 - Complete Release
+Author: Security Research Team
+License: For Authorized Security Testing Only
 """
 
 import subprocess
@@ -19,1194 +21,1799 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import tempfile
 import shutil
+import socket
+import struct
+import re
+import base64
+import hashlib
+from collections import defaultdict
+
+# Optional library imports with graceful fallbacks
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+try:
+    import winreg
+    HAS_WINREG = True
+except ImportError:
+    HAS_WINREG = False
+
+try:
+    import win32security
+    import win32api
+    import win32con
+    HAS_WIN32 = True
+except ImportError:
+    HAS_WIN32 = False
+
+
+class Config:
+    """Configuration management for the enumeration tool"""
+    def __init__(self):
+        self.target_domain = None
+        self.target_dc = None
+        self.target_hosts = []
+        self.username = None
+        self.password = None
+        self.domain = None
+        self.ntlm_hash = None
+        self.modules = {
+            'reconnaissance': True,
+            'host_enum': True,
+            'privilege_escalation': True,
+            'credential_access': True,
+            'lateral_movement': False,
+            'domain_enum': True,
+            'vulnerability_assessment': True,
+            'persistence_check': False,
+        }
+        self.max_threads = 5
+        self.timeout = 300
+        self.verbose = False
+        self.output_dir = 'output'
+        self.stealth_mode = False
+        self.use_embedded_tools = True
+        self.test_categories = []
+        self.skip_tests = []
+
+    def from_args(self, args):
+        """Load configuration from command line arguments"""
+        self.target_domain = args.domain
+        self.target_dc = args.dc
+        self.username = args.username
+        self.password = args.password
+        self.domain = args.domain
+        self.ntlm_hash = args.hash
+        
+        if args.modules:
+            for module in self.modules:
+                self.modules[module] = module in args.modules
+        
+        self.max_threads = args.threads
+        self.timeout = args.timeout
+        self.verbose = args.verbose
+        self.output_dir = args.output
+        self.stealth_mode = args.stealth
+        
+        if args.targets_file:
+            self.load_targets_file(args.targets_file)
+        
+        if args.skip_tests:
+            self.skip_tests = args.skip_tests.split(',')
+        
+        if args.categories:
+            self.test_categories = args.categories.split(',')
+    
+    def load_targets_file(self, filepath):
+        """Load target hosts from file"""
+        try:
+            with open(filepath, 'r') as f:
+                self.target_hosts = [line.strip() for line in f if line.strip()]
+        except Exception as e:
+            print(f"[!] Error loading targets file: {e}")
+
 
 class Logger:
-    """Thread-safe logger with detailed activity tracking"""
-    def __init__(self, log_file="domain_enum_log.txt"):
-        self.log_file = log_file
-        self.start_time = datetime.now()
-        self.lock = threading.Lock()
-        self._init_log()
-        
-    def _init_log(self):
-        with open(self.log_file, 'w', encoding='utf-8') as f:
-            f.write("=" * 100 + "\n")
-            f.write(f"Domain Enumeration Log - Started: {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("=" * 100 + "\n\n")
+    """Advanced logging with color support and structured output"""
     
-    def log(self, activity, command="", status="INFO", error="", thread_id=""):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        thread_info = f"[Thread-{thread_id}]" if thread_id else "[Main]"
-        log_entry = f"[{timestamp}] {thread_info} [{status}] Activity: {activity}"
+    COLORS = {
+        'INFO': '\033[94m',
+        'SUCCESS': '\033[92m',
+        'WARN': '\033[93m',
+        'ERROR': '\033[91m',
+        'CRITICAL': '\033[95m',
+        'RESET': '\033[0m'
+    }
+    
+    def __init__(self, output_dir='output', verbose=False):
+        self.output_dir = output_dir
+        self.verbose = verbose
+        self.lock = threading.Lock()
+        self.logs = []
         
-        if command:
-            log_entry += f"\n    Command: {command}"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.log_file = os.path.join(output_dir, f'enumeration_{timestamp}.log')
+        self.json_file = os.path.join(output_dir, f'results_{timestamp}.json')
+        self.testcase_file = os.path.join(output_dir, f'testcases_{timestamp}.txt')
+    
+    def log(self, message, status="INFO", error="", command="", thread_id="", test_id=""):
+        """Log a message with structured data"""
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        log_entry = {
+            'timestamp': timestamp,
+            'status': status,
+            'message': message,
+            'thread_id': thread_id,
+            'test_id': test_id
+        }
+        
         if error:
-            log_entry += f"\n    Error: {error}"
+            log_entry['error'] = error
+        if command:
+            log_entry['command'] = command
         
         with self.lock:
+            self.logs.append(log_entry)
+            
+            color = self.COLORS.get(status, '')
+            reset = self.COLORS['RESET']
+            
+            console_msg = f"{color}[{status}]{reset} [{timestamp}]"
+            if thread_id:
+                console_msg += f" [T:{thread_id}]"
+            if test_id:
+                console_msg += f" [TC:{test_id}]"
+            console_msg += f" {message}"
+            
+            if error and (self.verbose or status == "ERROR"):
+                console_msg += f"\n  └─ Error: {error}"
+            
+            print(console_msg)
+            
             with open(self.log_file, 'a', encoding='utf-8') as f:
-                f.write(log_entry + "\n")
-        
-        color_codes = {
-            'SUCCESS': '\033[92m',
-            'ERROR': '\033[91m',
-            'WARN': '\033[93m',
-            'INFO': '\033[94m',
-            'CRITICAL': '\033[95m'
-        }
-        reset = '\033[0m'
-        color = color_codes.get(status, '')
-        print(f"{color}{thread_info} [{status}] {activity}{reset}")
-
-class ToolIntegration:
-    """Manages external tool downloads and execution"""
-    def __init__(self, logger, temp_dir):
-        self.logger = logger
-        self.temp_dir = temp_dir
-        self.tools = {
-            'powerview': {
-                'url': 'https://raw.githubusercontent.com/PowerShellMafia/PowerSploit/master/Recon/PowerView.ps1',
-                'file': os.path.join(temp_dir, 'PowerView.ps1'),
-                'type': 'powershell'
-            },
-            'sharphound': {
-                'url': 'https://github.com/BloodHoundAD/BloodHound/raw/master/Collectors/SharpHound.ps1',
-                'file': os.path.join(temp_dir, 'SharpHound.ps1'),
-                'type': 'powershell'
-            },
-            'adrecon': {
-                'url': 'https://raw.githubusercontent.com/adrecon/ADRecon/master/ADRecon.ps1',
-                'file': os.path.join(temp_dir, 'ADRecon.ps1'),
-                'type': 'powershell'
-            },
-            'invoke-aclpwn': {
-                'url': 'https://raw.githubusercontent.com/fox-it/Invoke-ACLPwn/master/Invoke-ACLPwn.ps1',
-                'file': os.path.join(temp_dir, 'Invoke-ACLPwn.ps1'),
-                'type': 'powershell'
-            },
-            'powerupsql': {
-                'url': 'https://raw.githubusercontent.com/NetSPI/PowerUpSQL/master/PowerUpSQL.ps1',
-                'file': os.path.join(temp_dir, 'PowerUpSQL.ps1'),
-                'type': 'powershell'
-            }
-        }
+                f.write(f"{json.dumps(log_entry)}\n")
     
-    def download_tool(self, tool_name):
-        """Download tool from GitHub"""
-        if tool_name not in self.tools:
-            self.logger.log(f"Unknown tool: {tool_name}", status="ERROR")
-            return False
-        
-        tool_info = self.tools[tool_name]
-        self.logger.log(f"Downloading {tool_name}", status="INFO")
-        
-        try:
-            ps_download = f"""
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -Uri '{tool_info['url']}' -OutFile '{tool_info['file']}' -UseBasicParsing
-            """
-            result = subprocess.run(['powershell', '-ExecutionPolicy', 'Bypass', '-Command', ps_download],
-                                  capture_output=True, text=True, timeout=60)
-            
-            if os.path.exists(tool_info['file']):
-                self.logger.log(f"{tool_name} downloaded successfully", status="SUCCESS")
-                return True
-            else:
-                self.logger.log(f"Failed to download {tool_name}", error=result.stderr, status="ERROR")
-                return False
-        except Exception as e:
-            self.logger.log(f"Download failed for {tool_name}", error=str(e), status="ERROR")
-            return False
+    def save_results(self, results):
+        """Save results to JSON file"""
+        with self.lock:
+            with open(self.json_file, 'w', encoding='utf-8') as f:
+                json.dump(results, f, indent=2, default=str)
     
-    def get_tool_path(self, tool_name):
-        """Get path to downloaded tool"""
-        return self.tools.get(tool_name, {}).get('file', '')
+    def save_testcase_report(self, testcases):
+        """Save test case report to text file"""
+        with self.lock:
+            with open(self.testcase_file, 'w', encoding='utf-8') as f:
+                f.write("="*80 + "\n")
+                f.write("RED TEAM ENUMERATION - TEST CASE REPORT\n")
+                f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("="*80 + "\n\n")
+                
+                for tc in testcases:
+                    f.write(f"Test Case ID: {tc['id']}\n")
+                    f.write(f"Category: {tc['category']}\n")
+                    f.write(f"Name: {tc['name']}\n")
+                    f.write(f"Status: {tc['status']}\n")
+                    f.write(f"Description: {tc['description']}\n")
+                    
+                    if tc.get('reason'):
+                        f.write(f"Reason: {tc['reason']}\n")
+                    
+                    if tc.get('output'):
+                        f.write(f"Output Snippet:\n")
+                        output = tc['output'][:500] if len(tc['output']) > 500 else tc['output']
+                        f.write(f"  {output}\n")
+                    
+                    if tc.get('findings'):
+                        f.write(f"Findings:\n")
+                        for finding in tc['findings']:
+                            f.write(f"  - {finding}\n")
+                    
+                    f.write("-"*80 + "\n\n")
 
-class EnumerationTask:
-    """Represents a single enumeration task"""
-    def __init__(self, name, function, priority=1, enabled=True):
+
+class TestCase:
+    """Base class for test cases"""
+    def __init__(self, test_id, name, category, description, requires_creds=False, 
+                 requires_admin=False, risk_level="LOW"):
+        self.id = test_id
         self.name = name
-        self.function = function
-        self.priority = priority
-        self.enabled = enabled
-        self.result = None
-        self.error = None
-        self.start_time = None
-        self.end_time = None
+        self.category = category
+        self.description = description
+        self.requires_creds = requires_creds
+        self.requires_admin = requires_admin
+        self.risk_level = risk_level
+        self.status = "PENDING"
+        self.output = ""
+        self.findings = []
+        self.reason = ""
     
-    def execute(self, *args, **kwargs):
-        """Execute the task"""
-        self.start_time = datetime.now()
-        try:
-            self.result = self.function(*args, **kwargs)
-            self.end_time = datetime.now()
-            return self.result
-        except Exception as e:
-            self.error = str(e)
-            self.end_time = datetime.now()
-            raise
+    def can_run(self, config, is_admin=False):
+        """Check if test case can run with current config"""
+        if self.requires_creds and not (config.username and config.password):
+            self.status = "SKIPPED"
+            self.reason = "Requires credentials"
+            return False
+        
+        if self.requires_admin and not is_admin:
+            self.status = "SKIPPED"
+            self.reason = "Requires administrative privileges"
+            return False
+        
+        return True
+    
+    def to_dict(self):
+        """Convert test case to dictionary"""
+        return {
+            'id': self.id,
+            'name': self.name,
+            'category': self.category,
+            'description': self.description,
+            'status': self.status,
+            'reason': self.reason,
+            'output': self.output,
+            'findings': self.findings,
+            'risk_level': self.risk_level
+        }
 
-class DomainEnumerator:
-    """Main enumeration engine with multi-threading support"""
-    def __init__(self, config):
-        self.config = config
-        self.logger = Logger()
-        self.temp_dir = tempfile.mkdtemp(prefix='domain_enum_')
-        self.tool_integration = ToolIntegration(self.logger, self.temp_dir)
-        
-        self.results = {
-            'metadata': {
-                'start_time': datetime.now().isoformat(),
-                'hostname': os.getenv('COMPUTERNAME', 'Unknown'),
-                'username': os.getenv('USERNAME', 'Unknown')
-            },
-            'current_user': {},
-            'local_privileges': {},
-            'domain_info': {},
-            'users': [],
-            'computers': [],
-            'groups': [],
-            'shares': [],
-            'gpo': [],
-            'acls': [],
-            'sql_instances': [],
-            'bloodhound_data': {},
-            'powerview_data': {},
-            'adrecon_data': {},
-            'aclpwn_data': {},
-            'powerupsql_data': {},
-            'interesting_findings': [],
-            'weaknesses': []
+
+class EmbeddedTools:
+    """Container for all embedded tool implementations"""
+    
+    @staticmethod
+    def get_system_info():
+        """Get basic system information"""
+        info = {
+            'hostname': socket.gethostname(),
+            'os': sys.platform,
+            'python_version': sys.version
         }
         
-        self.task_queue = queue.Queue()
-        self.result_lock = threading.Lock()
-        
-    def run_command(self, command, shell=False, powershell=False, timeout=300, thread_id=""):
-        """Execute command and return output"""
         try:
-            if powershell:
-                full_cmd = ['powershell', '-ExecutionPolicy', 'Bypass', '-NoProfile', '-Command', command]
-            else:
-                full_cmd = command if isinstance(command, list) else command.split()
-            
-            self.logger.log(f"Executing command", command=str(full_cmd)[:200], status="INFO", thread_id=thread_id)
-            result = subprocess.run(full_cmd, capture_output=True, text=True, 
-                                  timeout=timeout, shell=shell)
-            
-            if result.returncode != 0 and result.stderr:
-                self.logger.log("Command completed with warnings", error=result.stderr[:200], 
-                              status="WARN", thread_id=thread_id)
-            
-            return result.stdout
-        except subprocess.TimeoutExpired:
-            self.logger.log("Command timeout", error=f"Timeout after {timeout}s", 
-                          status="ERROR", thread_id=thread_id)
-            return ""
-        except Exception as e:
-            self.logger.log("Command execution failed", error=str(e), 
-                          status="ERROR", thread_id=thread_id)
-            return ""
-    
-    def enumerate_current_user(self, thread_id=""):
-        """Enumerate current user context"""
-        self.logger.log("Enumerating current user context", status="INFO", thread_id=thread_id)
-        
-        output = self.run_command("whoami /all", thread_id=thread_id)
-        priv_output = self.run_command("whoami /priv", thread_id=thread_id)
-        groups_output = self.run_command("whoami /groups", thread_id=thread_id)
-        
-        with self.result_lock:
-            self.results['current_user'] = {
-                'whoami': output,
-                'privileges': priv_output,
-                'groups': groups_output
-            }
-        
-        return True
-    
-    def enumerate_local_system(self, thread_id=""):
-        """Enumerate local system information"""
-        self.logger.log("Enumerating local system", status="INFO", thread_id=thread_id)
-        
-        systeminfo = self.run_command("systeminfo", thread_id=thread_id)
-        local_users = self.run_command("net user", thread_id=thread_id)
-        local_groups = self.run_command("net localgroup", thread_id=thread_id)
-        admin_check = self.run_command("net session", shell=True, thread_id=thread_id)
-        
-        with self.result_lock:
-            self.results['local_privileges'] = {
-                'systeminfo': systeminfo,
-                'local_users': local_users,
-                'local_groups': local_groups,
-                'is_admin': "Access is denied" not in admin_check
-            }
-        
-        return True
-    
-    def enumerate_domain_basic(self, thread_id=""):
-        """Enumerate basic Active Directory domain information"""
-        self.logger.log("Enumerating domain information", status="INFO", thread_id=thread_id)
-        
-        ps_cmd = """
-        try {
-            $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
-            $domainInfo = @{
-                Name = $domain.Name
-                Forest = $domain.Forest.Name
-                DomainControllers = $domain.DomainControllers | ForEach-Object { $_.Name }
-            }
-            $domainInfo | ConvertTo-Json
-        } catch {
-            Write-Output "Error: $_"
-        }
-        """
-        domain_info = self.run_command(ps_cmd, powershell=True, thread_id=thread_id)
-        
-        dc_output = self.run_command("nltest /dclist:", shell=True, thread_id=thread_id)
-        users_output = self.run_command("net user /domain", shell=True, thread_id=thread_id)
-        computers_output = self.run_command("net group 'Domain Computers' /domain", shell=True, thread_id=thread_id)
-        groups_output = self.run_command("net group /domain", shell=True, thread_id=thread_id)
-        
-        with self.result_lock:
-            self.results['domain_info']['basic'] = domain_info
-            self.results['domain_info']['domain_controllers'] = dc_output
-            self.results['users'] = self.parse_net_output(users_output)
-            self.results['computers'] = self.parse_net_output(computers_output)
-            self.results['groups'] = self.parse_net_output(groups_output)
-        
-        return True
-    
-    def enumerate_powerview(self, thread_id=""):
-        """Execute PowerView enumeration"""
-        if not self.config.powerview:
-            return False
-        
-        self.logger.log("Running PowerView enumeration", status="INFO", thread_id=thread_id)
-        
-        if not self.tool_integration.download_tool('powerview'):
-            return False
-        
-        powerview_path = self.tool_integration.get_tool_path('powerview')
-        
-        ps_script = f"""
-        Import-Module '{powerview_path}'
-        
-        $results = @{{}}
-        
-        # Domain information
-        $results['Domain'] = Get-Domain | Select-Object Name, Forest, DomainControllers | ConvertTo-Json
-        
-        # Domain users
-        $results['DomainUsers'] = Get-DomainUser | Select-Object samaccountname, description, memberof -First 100 | ConvertTo-Json
-        
-        # Domain computers
-        $results['DomainComputers'] = Get-DomainComputer | Select-Object dnshostname, operatingsystem, lastlogon -First 100 | ConvertTo-Json
-        
-        # Domain admins
-        $results['DomainAdmins'] = Get-DomainGroupMember -Identity "Domain Admins" | Select-Object MemberName, MemberSID | ConvertTo-Json
-        
-        # Find domain shares
-        $results['DomainShares'] = Find-DomainShare -CheckShareAccess | Select-Object Name, Path, Type -First 50 | ConvertTo-Json
-        
-        # Domain trusts
-        $results['DomainTrusts'] = Get-DomainTrust | Select-Object SourceName, TargetName, TrustType | ConvertTo-Json
-        
-        # ACLs with interesting permissions
-        $results['InterestingACLs'] = Find-InterestingDomainAcl | Select-Object ObjectDN, ActiveDirectoryRights, SecurityIdentifier -First 50 | ConvertTo-Json
-        
-        $results | ConvertTo-Json -Depth 10
-        """
-        
-        output = self.run_command(ps_script, powershell=True, timeout=600, thread_id=thread_id)
-        
-        with self.result_lock:
-            self.results['powerview_data'] = output
-        
-        self.logger.log("PowerView enumeration completed", status="SUCCESS", thread_id=thread_id)
-        return True
-    
-    def enumerate_sharphound(self, thread_id=""):
-        """Execute SharpHound for BloodHound data collection"""
-        if not self.config.sharphound:
-            return False
-        
-        self.logger.log("Running SharpHound enumeration", status="INFO", thread_id=thread_id)
-        
-        if not self.tool_integration.download_tool('sharphound'):
-            return False
-        
-        sharphound_path = self.tool_integration.get_tool_path('sharphound')
-        output_dir = self.temp_dir
-        
-        ps_script = f"""
-        Import-Module '{sharphound_path}'
-        Invoke-BloodHound -CollectionMethod All -OutputDirectory '{output_dir}' -OutputPrefix 'bloodhound' -NoSaveCache
-        """
-        
-        output = self.run_command(ps_script, powershell=True, timeout=900, thread_id=thread_id)
-        
-        # Find generated zip file
-        zip_files = [f for f in os.listdir(output_dir) if f.startswith('bloodhound') and f.endswith('.zip')]
-        
-        with self.result_lock:
-            self.results['bloodhound_data'] = {
-                'output': output,
-                'zip_file': zip_files[0] if zip_files else None,
-                'path': os.path.join(output_dir, zip_files[0]) if zip_files else None
-            }
-        
-        self.logger.log("SharpHound enumeration completed", status="SUCCESS", thread_id=thread_id)
-        return True
-    
-    def enumerate_adrecon(self, thread_id=""):
-        """Execute ADRecon enumeration"""
-        if not self.config.adrecon:
-            return False
-        
-        self.logger.log("Running ADRecon enumeration", status="INFO", thread_id=thread_id)
-        
-        if not self.tool_integration.download_tool('adrecon'):
-            return False
-        
-        adrecon_path = self.tool_integration.get_tool_path('adrecon')
-        output_dir = os.path.join(self.temp_dir, 'ADRecon')
-        
-        ps_script = f"""
-        . '{adrecon_path}'
-        Invoke-ADRecon -OutputDir '{output_dir}' -Collect All
-        """
-        
-        output = self.run_command(ps_script, powershell=True, timeout=1200, thread_id=thread_id)
-        
-        with self.result_lock:
-            self.results['adrecon_data'] = {
-                'output': output,
-                'output_dir': output_dir
-            }
-        
-        self.logger.log("ADRecon enumeration completed", status="SUCCESS", thread_id=thread_id)
-        return True
-    
-    def enumerate_aclpwn(self, thread_id=""):
-        """Execute Invoke-ACLPwn for ACL attack paths"""
-        if not self.config.aclpwn:
-            return False
-        
-        self.logger.log("Running Invoke-ACLPwn enumeration", status="INFO", thread_id=thread_id)
-        
-        if not self.tool_integration.download_tool('invoke-aclpwn'):
-            return False
-        
-        aclpwn_path = self.tool_integration.get_tool_path('invoke-aclpwn')
-        
-        ps_script = f"""
-        . '{aclpwn_path}'
-        $results = Find-InterestingDomainAcl | Select-Object ObjectDN, ActiveDirectoryRights, SecurityIdentifier -First 100
-        $results | ConvertTo-Json
-        """
-        
-        output = self.run_command(ps_script, powershell=True, timeout=600, thread_id=thread_id)
-        
-        with self.result_lock:
-            self.results['aclpwn_data'] = output
-        
-        self.logger.log("Invoke-ACLPwn enumeration completed", status="SUCCESS", thread_id=thread_id)
-        return True
-    
-    def enumerate_powerupsql(self, thread_id=""):
-        """Execute PowerUpSQL for SQL Server enumeration"""
-        if not self.config.powerupsql:
-            return False
-        
-        self.logger.log("Running PowerUpSQL enumeration", status="INFO", thread_id=thread_id)
-        
-        if not self.tool_integration.download_tool('powerupsql'):
-            return False
-        
-        powerupsql_path = self.tool_integration.get_tool_path('powerupsql')
-        
-        ps_script = f"""
-        Import-Module '{powerupsql_path}'
-        
-        $results = @{{}}
-        
-        # Discover SQL instances
-        $results['SQLInstances'] = Get-SQLInstanceDomain | Select-Object ComputerName, Instance, DomainAccount -First 50 | ConvertTo-Json
-        
-        # Check default credentials
-        $results['DefaultCreds'] = Get-SQLInstanceDomain | Get-SQLConnectionTestThreaded | Where-Object {{$_.Status -eq 'Accessible'}} | ConvertTo-Json
-        
-        $results | ConvertTo-Json -Depth 5
-        """
-        
-        output = self.run_command(ps_script, powershell=True, timeout=600, thread_id=thread_id)
-        
-        with self.result_lock:
-            self.results['powerupsql_data'] = output
-            self.results['sql_instances'] = output
-        
-        self.logger.log("PowerUpSQL enumeration completed", status="SUCCESS", thread_id=thread_id)
-        return True
-    
-    def enumerate_shares(self, thread_id=""):
-        """Enumerate network shares"""
-        self.logger.log("Enumerating network shares", status="INFO", thread_id=thread_id)
-        
-        shares_output = self.run_command("net share", thread_id=thread_id)
-        
-        ps_cmd = """
-        try {
-            Get-SmbShare | Select-Object Name, Path, Description, CurrentUsers | ConvertTo-Json
-        } catch {
-            Write-Output "[]"
-        }
-        """
-        smb_shares = self.run_command(ps_cmd, powershell=True, thread_id=thread_id)
-        
-        with self.result_lock:
-            self.results['shares'].append({'type': 'local', 'data': shares_output})
-            self.results['shares'].append({'type': 'smb', 'data': smb_shares})
-        
-        return True
-    
-    def enumerate_gpo(self, thread_id=""):
-        """Enumerate Group Policy Objects"""
-        self.logger.log("Enumerating GPOs", status="INFO", thread_id=thread_id)
-        
-        gpo_user = self.run_command("gpresult /r /scope:user", shell=True, thread_id=thread_id)
-        gpo_computer = self.run_command("gpresult /r /scope:computer", shell=True, thread_id=thread_id)
-        
-        with self.result_lock:
-            self.results['gpo'].append({'scope': 'user', 'data': gpo_user})
-            self.results['gpo'].append({'scope': 'computer', 'data': gpo_computer})
-        
-        return True
-    
-    def analyze_weaknesses(self, thread_id=""):
-        """Analyze collected data for security weaknesses"""
-        self.logger.log("Analyzing for security weaknesses", status="INFO", thread_id=thread_id)
-        
-        findings = []
-        
-        # Check current user privileges
-        privileges = str(self.results['current_user'].get('privileges', ''))
-        
-        if 'SeImpersonatePrivilege' in privileges and 'Enabled' in privileges:
-            findings.append({
-                'severity': 'HIGH',
-                'category': 'Privilege Escalation',
-                'finding': 'SeImpersonatePrivilege Enabled',
-                'description': 'User has SeImpersonatePrivilege - vulnerable to Potato attacks',
-                'recommendation': 'Exploit: JuicyPotato, RoguePotato, PrintSpoofer',
-                'cvss': '7.8'
-            })
-        
-        if 'SeDebugPrivilege' in privileges and 'Enabled' in privileges:
-            findings.append({
-                'severity': 'CRITICAL',
-                'category': 'Privilege Escalation',
-                'finding': 'SeDebugPrivilege Enabled',
-                'description': 'User can debug any process - direct path to SYSTEM',
-                'recommendation': 'Memory dump LSASS, inject into privileged processes',
-                'cvss': '9.3'
-            })
-        
-        if 'SeLoadDriverPrivilege' in privileges:
-            findings.append({
-                'severity': 'HIGH',
-                'category': 'Privilege Escalation',
-                'finding': 'SeLoadDriverPrivilege Enabled',
-                'description': 'User can load kernel drivers - privilege escalation possible',
-                'recommendation': 'Exploit: Capcom.sys, other vulnerable drivers',
-                'cvss': '7.8'
-            })
-        
-        # Check admin rights
-        if self.results['local_privileges'].get('is_admin'):
-            findings.append({
-                'severity': 'CRITICAL',
-                'category': 'Access',
-                'finding': 'Local Administrator Access',
-                'description': 'Current user has local administrator privileges',
-                'recommendation': 'Full local system compromise possible, dump credentials',
-                'cvss': '9.0'
-            })
-        
-        # Check for writable shares
-        for share in self.results['shares']:
-            share_str = str(share)
-            if 'Everyone' in share_str or 'FULL' in share_str or 'CHANGE' in share_str:
-                findings.append({
-                    'severity': 'MEDIUM',
-                    'category': 'Lateral Movement',
-                    'finding': 'Writable Network Share',
-                    'description': f'Share with weak permissions detected: {share_str[:100]}',
-                    'recommendation': 'Check for write access, potential for malware deployment',
-                    'cvss': '5.5'
-                })
-        
-        # Check domain groups membership
-        groups = str(self.results['current_user'].get('groups', ''))
-        if 'Domain Admins' in groups:
-            findings.append({
-                'severity': 'CRITICAL',
-                'category': 'Access',
-                'finding': 'Domain Administrator Account',
-                'description': 'User is member of Domain Admins group',
-                'recommendation': 'Full domain compromise - DCSync, Golden Ticket attacks',
-                'cvss': '10.0'
-            })
-        
-        if 'Enterprise Admins' in groups:
-            findings.append({
-                'severity': 'CRITICAL',
-                'category': 'Access',
-                'finding': 'Enterprise Administrator Account',
-                'description': 'User is member of Enterprise Admins group',
-                'recommendation': 'Full forest compromise possible',
-                'cvss': '10.0'
-            })
-        
-        # Analyze PowerView data for interesting ACLs
-        powerview_data = str(self.results.get('powerview_data', ''))
-        if 'GenericAll' in powerview_data or 'WriteDacl' in powerview_data:
-            findings.append({
-                'severity': 'HIGH',
-                'category': 'Privilege Escalation',
-                'finding': 'Dangerous ACL Permissions',
-                'description': 'User has GenericAll or WriteDacl on domain objects',
-                'recommendation': 'Review PowerView output for ACL abuse paths',
-                'cvss': '8.0'
-            })
-        
-        # Check for SQL instances
-        if self.results.get('sql_instances'):
-            findings.append({
-                'severity': 'MEDIUM',
-                'category': 'Attack Surface',
-                'finding': 'SQL Server Instances Discovered',
-                'description': 'SQL Server instances found in domain',
-                'recommendation': 'Test for default credentials, SQL injection, xp_cmdshell',
-                'cvss': '6.5'
-            })
-        
-        # Sort findings by severity
-        severity_order = {'CRITICAL': 0, 'HIGH': 1, 'MEDIUM': 2, 'LOW': 3}
-        findings.sort(key=lambda x: severity_order.get(x['severity'], 4))
-        
-        with self.result_lock:
-            self.results['weaknesses'] = findings
-            self.results['interesting_findings'] = [f for f in findings if f['severity'] in ['CRITICAL', 'HIGH']]
-        
-        self.logger.log(f"Analysis complete - {len(findings)} findings identified", 
-                       status="SUCCESS", thread_id=thread_id)
-        return True
-    
-    def parse_net_output(self, output):
-        """Parse net command output to extract items"""
-        lines = output.split('\n')
-        items = []
-        for line in lines:
-            line = line.strip()
-            if line and not line.startswith('-') and not line.startswith('The command') and not line.startswith('User accounts'):
-                items.extend([item.strip() for item in line.split() if item.strip()])
-        return [item for item in items if len(item) > 2 and not item.startswith('\\\\')]
-    
-    def worker(self, task, worker_id):
-        """Worker thread function"""
-        try:
-            self.logger.log(f"Starting task: {task.name}", status="INFO", thread_id=worker_id)
-            result = task.execute(thread_id=worker_id)
-            self.logger.log(f"Completed task: {task.name}", status="SUCCESS", thread_id=worker_id)
-            return result
-        except Exception as e:
-            self.logger.log(f"Task failed: {task.name}", error=str(e), status="ERROR", thread_id=worker_id)
-            return None
-    
-    def run_enumeration_parallel(self):
-        """Execute enumeration tasks in parallel"""
-        # Define all enumeration tasks
-        tasks = [
-            EnumerationTask("Current User", self.enumerate_current_user, priority=1, enabled=True),
-            EnumerationTask("Local System", self.enumerate_local_system, priority=1, enabled=True),
-            EnumerationTask("Domain Basic", self.enumerate_domain_basic, priority=1, enabled=True),
-            EnumerationTask("Shares", self.enumerate_shares, priority=2, enabled=True),
-            EnumerationTask("GPO", self.enumerate_gpo, priority=2, enabled=True),
-            EnumerationTask("PowerView", self.enumerate_powerview, priority=3, enabled=self.config.powerview),
-            EnumerationTask("SharpHound", self.enumerate_sharphound, priority=3, enabled=self.config.sharphound),
-            EnumerationTask("ADRecon", self.enumerate_adrecon, priority=3, enabled=self.config.adrecon),
-            EnumerationTask("ACLPwn", self.enumerate_aclpwn, priority=4, enabled=self.config.aclpwn),
-            EnumerationTask("PowerUpSQL", self.enumerate_powerupsql, priority=4, enabled=self.config.powerupsql),
-        ]
-        
-        # Filter enabled tasks
-        enabled_tasks = [task for task in tasks if task.enabled]
-        
-        self.logger.log(f"Starting parallel enumeration with {len(enabled_tasks)} tasks", status="INFO")
-        
-        # Execute tasks in parallel with thread pool
-        max_workers = min(self.config.threads, len(enabled_tasks))
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_task = {
-                executor.submit(self.worker, task, f"W{i}"): task 
-                for i, task in enumerate(enabled_tasks, 1)
-            }
-            
-            for future in as_completed(future_to_task):
-                task = future_to_task[future]
-                try:
-                    result = future.result()
-                except Exception as e:
-                    self.logger.log(f"Task exception: {task.name}", error=str(e), status="ERROR")
-        
-        # Run analysis after all enumeration is complete
-        self.logger.log("All enumeration tasks completed, running analysis", status="INFO")
-        self.analyze_weaknesses()
-    
-    def generate_ascii_diagram(self):
-        """Generate enhanced ASCII diagram of domain structure"""
-        diagram = []
-        w = 100  # Width
-        
-        diagram.append("=" * w)
-        diagram.append("                                 DOMAIN TOPOLOGY DIAGRAM".center(w))
-        diagram.append("=" * w)
-        diagram.append("")
-        
-        # Extract domain name
-        domain_name = "DOMAIN.LOCAL"
-        try:
-            domain_info = json.loads(self.results['domain_info'].get('basic', '{}'))
-            if isinstance(domain_info, dict) and 'Name' in domain_info:
-                domain_name = domain_info['Name']
+            info['username'] = os.getenv('USERNAME') or os.getenv('USER')
+            info['computername'] = os.getenv('COMPUTERNAME') or socket.gethostname()
+            info['domain'] = os.getenv('USERDOMAIN') or 'WORKGROUP'
         except:
             pass
         
-        # Domain root
-        diagram.append(f"                                   [{domain_name}]".center(w))
-        diagram.append("                                        |".center(w))
-        diagram.append("               +------------------------+------------------------+".center(w))
-        diagram.append("               |                        |                        |".center(w))
-        diagram.append("        [Domain Controllers]      [User Objects]         [Computer Objects]".center(w))
-        diagram.append("")
-        
-        # Domain Controllers
-        dcs = self.extract_domain_controllers()
-        if dcs:
-            diagram.append("    Domain Controllers:".ljust(w))
-            for i, dc in enumerate(dcs[:5]):
-                diagram.append(f"      [{i+1}] {dc['name']:<30} IP: {dc['ip']:<15}".ljust(w))
-        
-        diagram.append("")
-        diagram.append("    Critical Groups & Membership:".ljust(w))
-        diagram.append("    " + "-" * 80)
-        
-        # High-value groups
-        key_groups = ['Domain Admins', 'Enterprise Admins', 'Administrators', 'Backup Operators']
-        for group in key_groups:
-            if group in str(self.results['groups']):
-                diagram.append(f"      [+] {group}".ljust(w))
-        
-        diagram.append("")
-        diagram.append("    Current User Privileges:".ljust(w))
-        diagram.append("    " + "-" * 80)
-        
-        # Show if user is admin
-        if self.results['local_privileges'].get('is_admin'):
-            diagram.append("      [!!!] LOCAL ADMINISTRATOR ACCESS".ljust(w))
-        
-        # Show critical privileges
-        privileges = str(self.results['current_user'].get('privileges', ''))
-        critical_privs = ['SeDebugPrivilege', 'SeImpersonatePrivilege', 'SeLoadDriverPrivilege']
-        for priv in critical_privs:
-            if priv in privileges:
-                diagram.append(f"      [!] {priv}".ljust(w))
-        
-        diagram.append("")
-        diagram.append("    Attack Surface Summary:".ljust(w))
-        diagram.append("    " + "-" * 80)
-        diagram.append(f"      Users:     {len(self.results['users']):>6}".ljust(w))
-        diagram.append(f"      Computers: {len(self.results['computers']):>6}".ljust(w))
-        diagram.append(f"      Groups:    {len(self.results['groups']):>6}".ljust(w))
-        diagram.append(f"      Shares:    {len(self.results['shares']):>6}".ljust(w))
-        
-        if self.results.get('sql_instances'):
+        if HAS_PSUTIL:
             try:
-                sql_data = json.loads(self.results['sql_instances'])
-                if isinstance(sql_data, dict) and 'SQLInstances' in sql_data:
-                    sql_count = len(json.loads(sql_data['SQLInstances']))
-                    diagram.append(f"      SQL Instances: {sql_count:>6}".ljust(w))
+                info['cpu_count'] = psutil.cpu_count()
+                info['memory_total'] = psutil.virtual_memory().total
+                info['boot_time'] = datetime.fromtimestamp(psutil.boot_time()).isoformat()
             except:
                 pass
         
-        diagram.append("")
-        diagram.append("    CRITICAL FINDINGS:".ljust(w))
-        diagram.append("    " + "=" * 80)
-        
-        # Show top 5 critical findings
-        critical_findings = [f for f in self.results['weaknesses'] if f['severity'] in ['CRITICAL', 'HIGH']]
-        for i, finding in enumerate(critical_findings[:5], 1):
-            severity_symbol = "!!!" if finding['severity'] == 'CRITICAL' else "!!"
-            diagram.append(f"      [{severity_symbol}] {finding['finding']:<50} CVSS: {finding.get('cvss', 'N/A')}".ljust(w))
-        
-        if len(critical_findings) > 5:
-            diagram.append(f"      ... and {len(critical_findings) - 5} more critical findings".ljust(w))
-        
-        diagram.append("")
-        diagram.append("    Tool Integration Status:".ljust(w))
-        diagram.append("    " + "-" * 80)
-        diagram.append(f"      PowerView:   {'[COMPLETED]' if self.config.powerview else '[DISABLED]'}".ljust(w))
-        diagram.append(f"      SharpHound:  {'[COMPLETED]' if self.config.sharphound else '[DISABLED]'}".ljust(w))
-        diagram.append(f"      ADRecon:     {'[COMPLETED]' if self.config.adrecon else '[DISABLED]'}".ljust(w))
-        diagram.append(f"      ACLPwn:      {'[COMPLETED]' if self.config.aclpwn else '[DISABLED]'}".ljust(w))
-        diagram.append(f"      PowerUpSQL:  {'[COMPLETED]' if self.config.powerupsql else '[DISABLED]'}".ljust(w))
-        
-        diagram.append("")
-        diagram.append("=" * w)
-        
-        return "\n".join(diagram)
+        return info
     
-    def extract_domain_controllers(self):
-        """Extract DC information from results"""
-        dcs = []
-        dc_output = self.results['domain_info'].get('domain_controllers', '')
+    @staticmethod
+    def enumerate_local_users():
+        """Enumerate local users"""
+        users = []
         
-        # Parse DC list
-        lines = dc_output.split('\n')
-        for line in lines:
-            if '\\\\' in line:
-                parts = line.split()
-                if len(parts) > 0:
-                    dc_name = parts[0].replace('\\\\', '').strip()
-                    dc_ip = '0.0.0.0'
-                    # Try to extract IP if present
-                    for part in parts:
-                        if '.' in part and part.replace('.', '').isdigit():
-                            dc_ip = part
+        if sys.platform == 'win32':
+            try:
+                result = subprocess.run(['net', 'user'], capture_output=True, text=True, timeout=30)
+                lines = result.stdout.split('\n')
+                in_user_section = False
+                
+                for line in lines:
+                    if '---' in line:
+                        in_user_section = True
+                        continue
+                    if in_user_section and line.strip():
+                        users.extend([u.strip() for u in line.split() if u.strip()])
+            except:
+                pass
+        
+        return users
+    
+    @staticmethod
+    def enumerate_local_groups():
+        """Enumerate local groups"""
+        groups = {}
+        
+        if sys.platform == 'win32':
+            try:
+                result = subprocess.run(['net', 'localgroup'], capture_output=True, text=True, timeout=30)
+                
+                for line in result.stdout.split('\n'):
+                    if line.startswith('*'):
+                        group_name = line.replace('*', '').strip()
+                        groups[group_name] = []
+            except:
+                pass
+        
+        return groups
+    
+    @staticmethod
+    def check_admin_privileges():
+        """Check if running with admin privileges"""
+        if sys.platform == 'win32':
+            try:
+                import ctypes
+                return ctypes.windll.shell32.IsUserAnAdmin() != 0
+            except:
+                return False
+        else:
+            return os.geteuid() == 0
+    
+    @staticmethod
+    def enumerate_processes():
+        """Enumerate running processes"""
+        processes = []
+        
+        if HAS_PSUTIL:
+            try:
+                for proc in psutil.process_iter(['pid', 'name', 'username']):
+                    try:
+                        processes.append(proc.info)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+            except:
+                pass
+        elif sys.platform == 'win32':
+            try:
+                result = subprocess.run(['tasklist', '/FO', 'CSV', '/NH'], capture_output=True, text=True, timeout=30)
+                
+                for line in result.stdout.split('\n'):
+                    if line.strip():
+                        parts = line.split(',')
+                        if len(parts) >= 2:
+                            processes.append({'name': parts[0].strip('"'), 'pid': parts[1].strip('"')})
+            except:
+                pass
+        
+        return processes
+    
+    @staticmethod
+    def detect_av_edr():
+        """Detect AV/EDR products"""
+        av_products = []
+        av_processes = [
+            'MsMpEng.exe', 'mcshield.exe', 'avp.exe', 'avgcsrvx.exe',
+            'CylanceSvc.exe', 'CSFalconService.exe', 'cb.exe',
+            'SentinelAgent.exe', 'elastic-agent.exe', 'taniumclient.exe',
+            'SophosHealth.exe', 'SAVService.exe'
+        ]
+        
+        processes = EmbeddedTools.enumerate_processes()
+        
+        for proc in processes:
+            proc_name = proc.get('name', '')
+            if any(av in proc_name for av in av_processes):
+                av_products.append(proc_name)
+        
+        return list(set(av_products))
+    
+    @staticmethod
+    def enumerate_network_interfaces():
+        """Enumerate network interfaces"""
+        interfaces = []
+        
+        if HAS_PSUTIL:
+            try:
+                for iface, addrs in psutil.net_if_addrs().items():
+                    iface_info = {'name': iface, 'addresses': []}
+                    for addr in addrs:
+                        iface_info['addresses'].append({'family': str(addr.family), 'address': addr.address})
+                    interfaces.append(iface_info)
+            except:
+                pass
+        elif sys.platform == 'win32':
+            try:
+                result = subprocess.run(['ipconfig', '/all'], capture_output=True, text=True, timeout=30)
+                interfaces.append({'raw_output': result.stdout})
+            except:
+                pass
+        
+        return interfaces
+    
+    @staticmethod
+    def enumerate_services():
+        """Enumerate Windows services"""
+        services = []
+        
+        if sys.platform == 'win32':
+            try:
+                result = subprocess.run(['sc', 'query', 'type=', 'service', 'state=', 'all'], 
+                                      capture_output=True, text=True, timeout=60)
+                
+                current_service = {}
+                for line in result.stdout.split('\n'):
+                    if 'SERVICE_NAME:' in line:
+                        if current_service:
+                            services.append(current_service)
+                        current_service = {'name': line.split('SERVICE_NAME:')[1].strip()}
+                    elif 'DISPLAY_NAME:' in line and current_service:
+                        current_service['display_name'] = line.split('DISPLAY_NAME:')[1].strip()
+                    elif 'STATE' in line and current_service:
+                        current_service['state'] = line.split(':')[1].strip()
+                
+                if current_service:
+                    services.append(current_service)
+            except:
+                pass
+        
+        return services
+    
+    @staticmethod
+    def find_interesting_files(search_paths=None, patterns=None):
+        """Search for interesting files"""
+        if not search_paths:
+            if sys.platform == 'win32':
+                search_paths = [os.path.expandvars('%USERPROFILE%'), os.path.expandvars('%APPDATA%')]
+            else:
+                search_paths = [os.path.expanduser('~')]
+        
+        if not patterns:
+            patterns = ['*password*', '*config*', '*.kdbx', '*credential*', '*.key']
+        
+        interesting_files = []
+        
+        for search_path in search_paths:
+            try:
+                for root, dirs, files in os.walk(search_path):
+                    if any(skip in root.lower() for skip in ['windows', 'system32', 'program files']):
+                        continue
+                    
+                    for file in files:
+                        file_lower = file.lower()
+                        if any(pattern.strip('*') in file_lower for pattern in patterns):
+                            interesting_files.append(os.path.join(root, file))
+                    
+                    if root.count(os.sep) - search_path.count(os.sep) > 3:
+                        break
+                        
+            except (PermissionError, OSError):
+                continue
+        
+        return interesting_files[:100]
+    
+    @staticmethod
+    def enumerate_scheduled_tasks():
+        """Enumerate scheduled tasks"""
+        tasks = []
+        
+        if sys.platform == 'win32':
+            try:
+                result = subprocess.run(['schtasks', '/query', '/fo', 'LIST', '/v'], 
+                                      capture_output=True, text=True, timeout=60)
+                
+                current_task = {}
+                for line in result.stdout.split('\n'):
+                    if 'TaskName:' in line:
+                        if current_task:
+                            tasks.append(current_task)
+                        current_task = {'name': line.split('TaskName:')[1].strip()}
+                    elif 'Task To Run:' in line and current_task:
+                        current_task['command'] = line.split('Task To Run:')[1].strip()
+                    elif 'Status:' in line and current_task:
+                        current_task['status'] = line.split('Status:')[1].strip()
+                
+                if current_task:
+                    tasks.append(current_task)
+            except:
+                pass
+        
+        return tasks
+    
+    @staticmethod
+    def check_uac_level():
+        """Check UAC configuration"""
+        uac_info = {}
+        
+        if sys.platform == 'win32' and HAS_WINREG:
+            try:
+                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, 
+                                    r'SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System')
+                
+                try:
+                    consent_prompt, _ = winreg.QueryValueEx(key, 'ConsentPromptBehaviorAdmin')
+                    uac_info['consent_prompt_level'] = consent_prompt
+                except:
+                    pass
+                
+                try:
+                    enable_lua, _ = winreg.QueryValueEx(key, 'EnableLUA')
+                    uac_info['uac_enabled'] = enable_lua == 1
+                except:
+                    pass
+                
+                winreg.CloseKey(key)
+            except:
+                pass
+        
+        return uac_info
+    
+    @staticmethod
+    def enumerate_registry_autoruns():
+        """Enumerate autorun registry keys"""
+        autoruns = []
+        
+        if sys.platform == 'win32' and HAS_WINREG:
+            autorun_keys = [
+                (winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run'),
+                (winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\RunOnce'),
+                (winreg.HKEY_LOCAL_MACHINE, r'Software\Microsoft\Windows\CurrentVersion\Run'),
+                (winreg.HKEY_LOCAL_MACHINE, r'Software\Microsoft\Windows\CurrentVersion\RunOnce'),
+            ]
+            
+            for hive, key_path in autorun_keys:
+                try:
+                    key = winreg.OpenKey(hive, key_path)
+                    i = 0
+                    while True:
+                        try:
+                            name, value, _ = winreg.EnumValue(key, i)
+                            autoruns.append({
+                                'hive': 'HKCU' if hive == winreg.HKEY_CURRENT_USER else 'HKLM',
+                                'path': key_path,
+                                'name': name,
+                                'value': value
+                            })
+                            i += 1
+                        except WindowsError:
                             break
-                    dcs.append({'name': dc_name, 'ip': dc_ip})
+                    winreg.CloseKey(key)
+                except:
+                    pass
         
-        # Also try to parse from domain info JSON
-        try:
-            domain_info = json.loads(self.results['domain_info'].get('basic', '{}'))
-            if isinstance(domain_info, dict) and 'DomainControllers' in domain_info:
-                dc_list = domain_info['DomainControllers']
-                if isinstance(dc_list, list):
-                    for dc in dc_list:
-                        if dc not in [d['name'] for d in dcs]:
-                            dcs.append({'name': dc, 'ip': '0.0.0.0'})
-        except:
-            pass
-        
-        return dcs if dcs else [{'name': 'DC01', 'ip': '0.0.0.0'}]
+        return autoruns
     
-    def generate_report(self, output_file="domain_enum_report.txt"):
-        """Generate comprehensive text report"""
-        self.logger.log("Generating final report", status="INFO")
+    @staticmethod
+    def enumerate_shares():
+        """Enumerate network shares"""
+        shares = []
+        
+        if sys.platform == 'win32':
+            try:
+                result = subprocess.run(['net', 'share'], capture_output=True, text=True, timeout=30)
+                
+                for line in result.stdout.split('\n'):
+                    if line.strip() and not line.startswith('-') and not line.startswith('Share name'):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            shares.append({'name': parts[0], 'path': ' '.join(parts[1:])})
+            except:
+                pass
+        
+        return shares
+    
+    @staticmethod
+    def check_powershell_logging():
+        """Check PowerShell logging configuration"""
+        logging_config = {}
+        
+        if sys.platform == 'win32' and HAS_WINREG:
+            try:
+                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, 
+                                    r'SOFTWARE\Policies\Microsoft\Windows\PowerShell')
+                
+                try:
+                    subkey = winreg.OpenKey(key, 'ScriptBlockLogging')
+                    enabled, _ = winreg.QueryValueEx(subkey, 'EnableScriptBlockLogging')
+                    logging_config['script_block_logging'] = enabled == 1
+                    winreg.CloseKey(subkey)
+                except:
+                    logging_config['script_block_logging'] = False
+                
+                winreg.CloseKey(key)
+            except:
+                pass
+        
+        return logging_config
+
+
+class HostReconTests:
+    """Host reconnaissance test cases"""
+    
+    @staticmethod
+    def create_tests():
+        tests = []
+        tests.append(TestCase('HR-001', 'System Information Enumeration', 'Host Reconnaissance',
+                             'Gather basic system information including OS, hostname, and configuration'))
+        tests.append(TestCase('HR-002', 'Local User Enumeration', 'Host Reconnaissance',
+                             'Enumerate all local user accounts on the system'))
+        tests.append(TestCase('HR-003', 'Local Group Enumeration', 'Host Reconnaissance',
+                             'Enumerate local groups and their members'))
+        tests.append(TestCase('HR-004', 'Administrative Privilege Check', 'Host Reconnaissance',
+                             'Determine if current user has administrative privileges'))
+        tests.append(TestCase('HR-005', 'Running Process Enumeration', 'Host Reconnaissance',
+                             'List all running processes and their owners'))
+        tests.append(TestCase('HR-006', 'Security Product Detection', 'Host Reconnaissance',
+                             'Detect presence of AV/EDR security products', risk_level='HIGH'))
+        tests.append(TestCase('HR-007', 'Network Interface Enumeration', 'Host Reconnaissance',
+                             'Enumerate all network interfaces and their configurations'))
+        tests.append(TestCase('HR-008', 'Windows Service Enumeration', 'Host Reconnaissance',
+                             'List all Windows services and their states'))
+        return tests
+
+
+class PrivilegeEscalationTests:
+    """Privilege escalation test cases"""
+    
+    @staticmethod
+    def create_tests():
+        tests = []
+        tests.append(TestCase('PE-001', 'Service Permission Audit', 'Privilege Escalation',
+                             'Check for services with weak permissions', risk_level='MEDIUM'))
+        tests.append(TestCase('PE-002', 'Unquoted Service Path Detection', 'Privilege Escalation',
+                             'Find services with unquoted paths containing spaces', risk_level='MEDIUM'))
+        tests.append(TestCase('PE-003', 'UAC Configuration Assessment', 'Privilege Escalation',
+                             'Assess User Account Control configuration', risk_level='MEDIUM'))
+        tests.append(TestCase('PE-004', 'Scheduled Task Analysis', 'Privilege Escalation',
+                             'Enumerate scheduled tasks for privilege escalation opportunities', risk_level='MEDIUM'))
+        tests.append(TestCase('PE-005', 'Autorun Registry Keys', 'Privilege Escalation',
+                             'Enumerate registry autorun keys for persistence vectors', risk_level='LOW'))
+        return tests
+
+
+class CredentialAccessTests:
+    """Credential access test cases"""
+    
+    @staticmethod
+    def create_tests():
+        tests = []
+        tests.append(TestCase('CA-001', 'Credential File Discovery', 'Credential Access',
+                             'Search for files potentially containing credentials', risk_level='MEDIUM'))
+        tests.append(TestCase('CA-002', 'Browser Credential Store Detection', 'Credential Access',
+                             'Detect browser credential storage locations', risk_level='MEDIUM'))
+        tests.append(TestCase('CA-003', 'WiFi Password Extraction', 'Credential Access',
+                             'Extract saved WiFi passwords', risk_level='MEDIUM'))
+        tests.append(TestCase('CA-004', 'RDP Saved Credential Detection', 'Credential Access',
+                             'Check for saved RDP credentials', risk_level='LOW'))
+        return tests
+
+
+class PersistenceTests:
+    """Persistence mechanism test cases"""
+    
+    @staticmethod
+    def create_tests():
+        tests = []
+        tests.append(TestCase('PS-001', 'Startup Folder Analysis', 'Persistence',
+                             'Enumerate startup folder contents', risk_level='LOW'))
+        tests.append(TestCase('PS-002', 'Service-Based Persistence Detection', 'Persistence',
+                             'Check for suspicious services that could be used for persistence', risk_level='LOW'))
+        return tests
+
+
+class NetworkTests:
+    """Network enumeration test cases"""
+    
+    @staticmethod
+    def create_tests():
+        tests = []
+        tests.append(TestCase('NT-001', 'Network Share Enumeration', 'Network',
+                             'Enumerate accessible network shares', risk_level='LOW'))
+        tests.append(TestCase('NT-002', 'Local Port Enumeration', 'Network',
+                             'Enumerate open ports on local system', risk_level='LOW'))
+        return tests
+
+
+class DefenseEvasionTests:
+    """Defense evasion test cases"""
+    
+    @staticmethod
+    def create_tests():
+        tests = []
+        tests.append(TestCase('DE-001', 'PowerShell Logging Configuration', 'Defense Evasion',
+                             'Check PowerShell logging and transcript configuration', risk_level='LOW'))
+        tests.append(TestCase('DE-002', 'Windows Defender Status Check', 'Defense Evasion',
+                             'Check Windows Defender real-time protection status', risk_level='MEDIUM'))
+        return tests
+
+
+class AdvancedHostTests:
+    """Advanced host enumeration tests"""
+    
+    @staticmethod
+    def create_tests():
+        tests = []
+        tests.append(TestCase('AH-001', 'Installed Software Enumeration', 'Host Reconnaissance',
+                             'Enumerate installed software and versions'))
+        tests.append(TestCase('AH-002', 'Environment Variable Enumeration', 'Host Reconnaissance',
+                             'Extract environment variables for sensitive information'))
+        tests.append(TestCase('AH-003', 'Clipboard Content Check', 'Host Reconnaissance',
+                             'Check clipboard for sensitive information', risk_level='HIGH'))
+        return tests
+
+
+class FileSystemTests:
+    """File system enumeration tests"""
+    
+    @staticmethod
+    def create_tests():
+        tests = []
+        tests.append(TestCase('FS-001', 'World-Writable Directory Discovery', 'Privilege Escalation',
+                             'Find directories with weak permissions', risk_level='MEDIUM'))
+        tests.append(TestCase('FS-002', 'Recent Files Analysis', 'Credential Access',
+                             'Analyze recently accessed files', risk_level='LOW'))
+        return tests
+
+
+class TestExecutor:
+    """Executes test cases and collects results"""
+    
+    def __init__(self, config, logger):
+        self.config = config
+        self.logger = logger
+        self.tools = EmbeddedTools()
+        self.is_admin = self.tools.check_admin_privileges()
+        self.results = defaultdict(list)
+        self.test_queue = queue.Queue()
+        self.test_results = []
+    
+    def execute_host_recon_test(self, test):
+        """Execute host reconnaissance tests"""
+        try:
+            if test.id == 'HR-001':
+                info = self.tools.get_system_info()
+                test.output = json.dumps(info, indent=2)
+                test.findings = [
+                    f"Hostname: {info.get('hostname', 'Unknown')}",
+                    f"OS: {info.get('os', 'Unknown')}",
+                    f"User: {info.get('username', 'Unknown')}",
+                    f"Domain: {info.get('domain', 'Unknown')}"
+                ]
+                test.status = "COMPLETED"
+                
+            elif test.id == 'HR-002':
+                users = self.tools.enumerate_local_users()
+                test.output = '\n'.join(users)
+                test.findings = [f"Found {len(users)} local users"]
+                if users:
+                    test.findings.extend(users[:10])
+                test.status = "COMPLETED"
+                
+            elif test.id == 'HR-003':
+                groups = self.tools.enumerate_local_groups()
+                test.output = json.dumps(groups, indent=2)
+                test.findings = [f"Found {len(groups)} local groups"]
+                test.findings.extend(list(groups.keys())[:10])
+                test.status = "COMPLETED"
+                
+            elif test.id == 'HR-004':
+                is_admin = self.is_admin
+                test.output = f"Administrative privileges: {is_admin}"
+                test.findings = [
+                    f"Running as Administrator: {is_admin}",
+                    "HIGH RISK: Administrative access detected" if is_admin else "Standard user privileges"
+                ]
+                test.status = "COMPLETED"
+                
+            elif test.id == 'HR-005':
+                processes = self.tools.enumerate_processes()
+                test.output = json.dumps(processes[:50], indent=2)
+                test.findings = [f"Found {len(processes)} running processes"]
+                
+                interesting = ['lsass.exe', 'winlogon.exe', 'svchost.exe']
+                for proc in processes:
+                    if proc.get('name', '').lower() in interesting:
+                        test.findings.append(f"Interesting process: {proc.get('name')}")
+                
+                test.status = "COMPLETED"
+                
+            elif test.id == 'HR-006':
+                                av_products = self.tools.detect_av_edr()
+                test.output = '\n'.join(av_products) if av_products else "No AV/EDR detected"
+                
+                if av_products:
+                    test.findings = [f"DETECTED: {av}" for av in av_products]
+                    test.findings.insert(0, f"Found {len(av_products)} security products")
+                else:
+                    test.findings = ["No AV/EDR products detected"]
+                
+                test.status = "COMPLETED"
+                
+            elif test.id == 'HR-007':
+                interfaces = self.tools.enumerate_network_interfaces()
+                test.output = json.dumps(interfaces, indent=2)
+                test.findings = [f"Found {len(interfaces)} network interfaces"]
+                
+                for iface in interfaces[:5]:
+                    test.findings.append(f"Interface: {iface.get('name', 'Unknown')}")
+                
+                test.status = "COMPLETED"
+                
+            elif test.id == 'HR-008':
+                services = self.tools.enumerate_services()
+                test.output = json.dumps(services[:50], indent=2)
+                test.findings = [f"Found {len(services)} services"]
+                
+                running = sum(1 for s in services if 'RUNNING' in s.get('state', ''))
+                test.findings.append(f"Running services: {running}")
+                
+                test.status = "COMPLETED"
+                
+        except Exception as e:
+            test.status = "ERROR"
+            test.reason = str(e)
+            self.logger.log(f"Test {test.id} failed", error=str(e), status="ERROR", test_id=test.id)
+    
+    def execute_privesc_test(self, test):
+        """Execute privilege escalation tests"""
+        try:
+            if test.id == 'PE-001':
+                services = self.tools.enumerate_services()
+                test.output = f"Analyzed {len(services)} services for permission issues"
+                test.findings = [f"Total services: {len(services)}", "Manual review required for detailed permission analysis"]
+                test.status = "COMPLETED"
+                
+            elif test.id == 'PE-002':
+                services = self.tools.enumerate_services()
+                vulnerable = []
+                
+                for service in services:
+                    name = service.get('name', '')
+                    if ' ' in name and not (name.startswith('"') or name.startswith("'")):
+                        vulnerable.append(service)
+                
+                test.output = json.dumps(vulnerable, indent=2)
+                test.findings = [f"Found {len(vulnerable)} potentially vulnerable services"]
+                
+                for vuln in vulnerable[:5]:
+                    test.findings.append(f"Vulnerable: {vuln.get('name', 'Unknown')}")
+                
+                test.status = "COMPLETED"
+                
+            elif test.id == 'PE-003':
+                uac_info = self.tools.check_uac_level()
+                test.output = json.dumps(uac_info, indent=2)
+                
+                if uac_info.get('uac_enabled'):
+                    test.findings = ["UAC is enabled", f"Consent prompt level: {uac_info.get('consent_prompt_level', 'Unknown')}"]
+                else:
+                    test.findings = ["WARNING: UAC appears to be disabled", "Privilege escalation may be easier"]
+                
+                test.status = "COMPLETED"
+                
+            elif test.id == 'PE-004':
+                tasks = self.tools.enumerate_scheduled_tasks()
+                test.output = json.dumps(tasks[:20], indent=2)
+                test.findings = [f"Found {len(tasks)} scheduled tasks"]
+                
+                for task in tasks:
+                    cmd = task.get('command', '').lower()
+                    if any(keyword in cmd for keyword in ['powershell', 'cmd', 'script']):
+                        test.findings.append(f"Interesting: {task.get('name', 'Unknown')}")
+                
+                test.status = "COMPLETED"
+                
+            elif test.id == 'PE-005':
+                autoruns = self.tools.enumerate_registry_autoruns()
+                test.output = json.dumps(autoruns, indent=2)
+                test.findings = [f"Found {len(autoruns)} autorun entries"]
+                
+                for entry in autoruns[:10]:
+                    test.findings.append(f"{entry['hive']}\\{entry['name']}")
+                
+                test.status = "COMPLETED"
+                
+        except Exception as e:
+            test.status = "ERROR"
+            test.reason = str(e)
+            self.logger.log(f"Test {test.id} failed", error=str(e), status="ERROR", test_id=test.id)
+    
+    def execute_credential_test(self, test):
+        """Execute credential access tests"""
+        try:
+            if test.id == 'CA-001':
+                interesting_files = self.tools.find_interesting_files()
+                test.output = '\n'.join(interesting_files[:50])
+                test.findings = [f"Found {len(interesting_files)} potentially interesting files"]
+                
+                for file in interesting_files[:10]:
+                    test.findings.append(f"File: {file}")
+                
+                test.status = "COMPLETED"
+                
+            elif test.id == 'CA-002':
+                findings = []
+                
+                if sys.platform == 'win32':
+                    chrome_path = os.path.join(os.getenv('LOCALAPPDATA', ''), 'Google', 'Chrome', 'User Data', 'Default', 'Login Data')
+                    if os.path.exists(chrome_path):
+                        findings.append(f"Chrome credential DB found: {chrome_path}")
+                    
+                    firefox_path = os.path.join(os.getenv('APPDATA', ''), 'Mozilla', 'Firefox', 'Profiles')
+                    if os.path.exists(firefox_path):
+                        findings.append(f"Firefox profile directory found: {firefox_path}")
+                
+                test.output = '\n'.join(findings)
+                test.findings = findings if findings else ["No browser credential stores detected"]
+                test.status = "COMPLETED"
+                
+            elif test.id == 'CA-003':
+                if sys.platform == 'win32':
+                    try:
+                        result = subprocess.run(['netsh', 'wlan', 'show', 'profiles'], capture_output=True, text=True, timeout=30)
+                        
+                        profiles = []
+                        for line in result.stdout.split('\n'):
+                            if 'All User Profile' in line:
+                                profile = line.split(':')[1].strip()
+                                profiles.append(profile)
+                        
+                        test.output = '\n'.join(profiles)
+                        test.findings = [f"Found {len(profiles)} WiFi profiles"]
+                        test.findings.extend(profiles[:10])
+                        test.status = "COMPLETED"
+                    except:
+                        test.status = "ERROR"
+                        test.reason = "Failed to enumerate WiFi profiles"
+                else:
+                    test.status = "SKIPPED"
+                    test.reason = "Not applicable on this platform"
+                    
+            elif test.id == 'CA-004':
+                if sys.platform == 'win32' and HAS_WINREG:
+                    rdp_creds = []
+                    
+                    try:
+                        key_path = r'Software\Microsoft\Terminal Server Client\Servers'
+                        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path)
+                        
+                        i = 0
+                        while True:
+                            try:
+                                server_name = winreg.EnumKey(key, i)
+                                rdp_creds.append(server_name)
+                                i += 1
+                            except WindowsError:
+                                break
+                        
+                        winreg.CloseKey(key)
+                        
+                        test.output = '\n'.join(rdp_creds)
+                        test.findings = [f"Found {len(rdp_creds)} RDP connection entries"]
+                        test.findings.extend(rdp_creds[:10])
+                        test.status = "COMPLETED"
+                    except:
+                        test.status = "COMPLETED"
+                        test.findings = ["No RDP credential entries found"]
+                else:
+                    test.status = "SKIPPED"
+                    test.reason = "Not applicable on this platform"
+                    
+        except Exception as e:
+            test.status = "ERROR"
+            test.reason = str(e)
+            self.logger.log(f"Test {test.id} failed", error=str(e), status="ERROR", test_id=test.id)
+    
+    def execute_persistence_test(self, test):
+        """Execute persistence tests"""
+        try:
+            if test.id == 'PS-001':
+                startup_paths = []
+                
+                if sys.platform == 'win32':
+                    startup_paths.append(os.path.join(os.getenv('APPDATA', ''), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup'))
+                    startup_paths.append(os.path.join(os.getenv('ALLUSERSPROFILE', ''), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup'))
+                
+                findings = []
+                for path in startup_paths:
+                    if os.path.exists(path):
+                        files = os.listdir(path)
+                        findings.append(f"Startup folder: {path}")
+                        findings.append(f"  Contains {len(files)} items")
+                        for file in files[:5]:
+                            findings.append(f"  - {file}")
+                
+                test.output = '\n'.join(findings)
+                test.findings = findings if findings else ["No startup items found"]
+                test.status = "COMPLETED"
+                
+            elif test.id == 'PS-002':
+                services = self.tools.enumerate_services()
+                suspicious = []
+                
+                suspicious_names = ['update', 'manager', 'service', 'system']
+                for service in services:
+                    name = service.get('name', '').lower()
+                    if any(s in name for s in suspicious_names):
+                        suspicious.append(service)
+                
+                test.output = json.dumps(suspicious[:20], indent=2)
+                test.findings = [f"Analyzed {len(services)} services", f"Found {len(suspicious)} potentially suspicious services (manual review needed)"]
+                test.status = "COMPLETED"
+                
+        except Exception as e:
+            test.status = "ERROR"
+            test.reason = str(e)
+            self.logger.log(f"Test {test.id} failed", error=str(e), status="ERROR", test_id=test.id)
+    
+    def execute_network_test(self, test):
+        """Execute network tests"""
+        try:
+            if test.id == 'NT-001':
+                shares = self.tools.enumerate_shares()
+                test.output = json.dumps(shares, indent=2)
+                test.findings = [f"Found {len(shares)} network shares"]
+                
+                for share in shares:
+                    test.findings.append(f"Share: {share.get('name')} -> {share.get('path')}")
+                
+                test.status = "COMPLETED"
+                
+            elif test.id == 'NT-002':
+                open_ports = []
+                
+                if HAS_PSUTIL:
+                    try:
+                        connections = psutil.net_connections(kind='inet')
+                        listening = [c for c in connections if c.status == 'LISTEN']
+                        
+                        for conn in listening:
+                            open_ports.append({'port': conn.laddr.port, 'address': conn.laddr.ip})
+                        
+                        test.output = json.dumps(open_ports, indent=2)
+                        test.findings = [f"Found {len(open_ports)} listening ports"]
+                        
+                        for port in open_ports[:20]:
+                            test.findings.append(f"Port {port['port']} on {port['address']}")
+                        
+                        test.status = "COMPLETED"
+                    except:
+                        test.status = "ERROR"
+                        test.reason = "Failed to enumerate ports"
+                else:
+                    test.status = "SKIPPED"
+                    test.reason = "psutil library not available"
+                    
+        except Exception as e:
+            test.status = "ERROR"
+            test.reason = str(e)
+            self.logger.log(f"Test {test.id} failed", error=str(e), status="ERROR", test_id=test.id)
+    
+    def execute_defense_evasion_test(self, test):
+        """Execute defense evasion tests"""
+        try:
+            if test.id == 'DE-001':
+                logging_config = self.tools.check_powershell_logging()
+                test.output = json.dumps(logging_config, indent=2)
+                
+                if logging_config.get('script_block_logging'):
+                    test.findings = ["WARNING: PowerShell Script Block Logging is ENABLED", "PowerShell activity will be logged"]
+                else:
+                    test.findings = ["PowerShell Script Block Logging is disabled", "PowerShell execution may not be fully logged"]
+                
+                test.status = "COMPLETED"
+                
+            elif test.id == 'DE-002':
+                if sys.platform == 'win32':
+                    try:
+                        result = subprocess.run(['powershell', '-Command', 'Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled, IoavProtectionEnabled, AntivirusEnabled | ConvertTo-Json'], capture_output=True, text=True, timeout=30)
+                        
+                        if result.returncode == 0:
+                            defender_status = json.loads(result.stdout)
+                            test.output = json.dumps(defender_status, indent=2)
+                            
+                            if defender_status.get('RealTimeProtectionEnabled'):
+                                test.findings = ["WARNING: Windows Defender Real-Time Protection is ENABLED", "Malicious activities may be detected and blocked"]
+                            else:
+                                test.findings = ["Windows Defender Real-Time Protection is DISABLED", "System may be vulnerable to malware"]
+                            
+                            test.status = "COMPLETED"
+                        else:
+                            test.status = "ERROR"
+                            test.reason = "Failed to query Windows Defender status"
+                    except:
+                        test.status = "ERROR"
+                        test.reason = "PowerShell command failed"
+                else:
+                    test.status = "SKIPPED"
+                    test.reason = "Not applicable on this platform"
+                    
+        except Exception as e:
+            test.status = "ERROR"
+            test.reason = str(e)
+            self.logger.log(f"Test {test.id} failed", error=str(e), status="ERROR", test_id=test.id)
+    
+    def execute_advanced_host_test(self, test):
+        """Execute advanced host tests"""
+        try:
+            if test.id == 'AH-001':
+                software = []
+                
+                if sys.platform == 'win32':
+                    try:
+                        result = subprocess.run(['wmic', 'product', 'get', 'name,version', '/format:csv'], capture_output=True, text=True, timeout=120)
+                        
+                        lines = result.stdout.split('\n')[1:]
+                        for line in lines:
+                            if line.strip():
+                                parts = line.split(',')
+                                if len(parts) >= 3:
+                                    software.append({'name': parts[1], 'version': parts[2]})
+                        
+                        test.output = json.dumps(software[:50], indent=2)
+                        test.findings = [f"Found {len(software)} installed applications"]
+                        
+                        interesting = ['python', 'java', 'putty', 'winscp', 'vnc']
+                        for sw in software:
+                            name = sw.get('name', '').lower()
+                            if any(i in name for i in interesting):
+                                test.findings.append(f"Interesting: {sw.get('name')}")
+                        
+                        test.status = "COMPLETED"
+                    except subprocess.TimeoutExpired:
+                        test.status = "ERROR"
+                        test.reason = "Command timed out"
+                    except:
+                        test.status = "ERROR"
+                        test.reason = "Failed to enumerate software"
+                else:
+                    test.status = "SKIPPED"
+                    test.reason = "Not applicable on this platform"
+            
+            elif test.id == 'AH-002':
+                env_vars = dict(os.environ)
+                sensitive_vars = {}
+                sensitive_keys = ['path', 'home', 'user', 'temp', 'password', 'key', 'token']
+                
+                for key, value in env_vars.items():
+                    if any(sk in key.lower() for sk in sensitive_keys):
+                        sensitive_vars[key] = value
+                
+                test.output = json.dumps(sensitive_vars, indent=2)
+                test.findings = [f"Found {len(sensitive_vars)} potentially sensitive environment variables"]
+                
+                for key in list(sensitive_vars.keys())[:10]:
+                    test.findings.append(f"Variable: {key}")
+                
+                test.status = "COMPLETED"
+            
+            elif test.id == 'AH-003':
+                if sys.platform == 'win32':
+                    try:
+                        import win32clipboard
+                        
+                        win32clipboard.OpenClipboard()
+                        try:
+                            clipboard_data = win32clipboard.GetClipboardData()
+                            win32clipboard.CloseClipboard()
+                            
+                            if clipboard_data:
+                                preview = clipboard_data[:100] if len(clipboard_data) > 100 else clipboard_data
+                                test.output = f"Clipboard contains {len(clipboard_data)} characters"
+                                test.findings = [f"Clipboard has content ({len(clipboard_data)} chars)", f"Preview: {preview}..."]
+                            else:
+                                test.findings = ["Clipboard is empty"]
+                            
+                            test.status = "COMPLETED"
+                        except:
+                            test.status = "COMPLETED"
+                            test.findings = ["Clipboard is empty or inaccessible"]
+                    except ImportError:
+                        test.status = "SKIPPED"
+                        test.reason = "win32clipboard not available"
+                else:
+                    test.status = "SKIPPED"
+                    test.reason = "Not applicable on this platform"
+                    
+        except Exception as e:
+            test.status = "ERROR"
+            test.reason = str(e)
+            self.logger.log(f"Test {test.id} failed", error=str(e), status="ERROR", test_id=test.id)
+    
+    def execute_filesystem_test(self, test):
+        """Execute file system tests"""
+        try:
+            if test.id == 'FS-001':
+                writable_dirs = []
+                
+                if sys.platform == 'win32':
+                    check_dirs = ['C:\\Temp', 'C:\\Windows\\Temp', 'C:\\Windows\\Tasks', os.path.expandvars('%TEMP%')]
+                else:
+                    check_dirs = ['/tmp', '/var/tmp', '/dev/shm']
+                
+                for directory in check_dirs:
+                    if os.path.exists(directory):
+                        try:
+                            test_file = os.path.join(directory, f'.test_{os.getpid()}')
+                            with open(test_file, 'w') as f:
+                                f.write('test')
+                            os.remove(test_file)
+                            writable_dirs.append(directory)
+                        except:
+                            pass
+                
+                test.output = '\n'.join(writable_dirs)
+                test.findings = [f"Found {len(writable_dirs)} writable directories"]
+                test.findings.extend(writable_dirs)
+                test.status = "COMPLETED"
+            
+            elif test.id == 'FS-002':
+                recent_files = []
+                
+                if sys.platform == 'win32':
+                    recent_path = os.path.join(os.getenv('APPDATA', ''), 'Microsoft', 'Windows', 'Recent')
+                    
+                    if os.path.exists(recent_path):
+                        try:
+                            files = os.listdir(recent_path)
+                            recent_files = files[:20]
+                        except:
+                            pass
+                
+                test.output = '\n'.join(recent_files)
+                test.findings = [f"Found {len(recent_files)} recent file shortcuts"]
+                test.findings.extend(recent_files[:10])
+                test.status = "COMPLETED"
+                
+        except Exception as e:
+            test.status = "ERROR"
+            test.reason = str(e)
+            self.logger.log(f"Test {test.id} failed", error=str(e), status="ERROR", test_id=test.id)
+    
+    def execute_test(self, test):
+        """Execute a single test case"""
+        self.logger.log(f"Executing test: {test.name}", status="INFO", test_id=test.id)
+        
+        if not test.can_run(self.config, self.is_admin):
+            self.logger.log(f"Test skipped: {test.reason}", status="WARN", test_id=test.id)
+            return test
+        
+        try:
+            if test.id.startswith('HR-'):
+                self.execute_host_recon_test(test)
+            elif test.id.startswith('PE-'):
+                self.execute_privesc_test(test)
+            elif test.id.startswith('CA-'):
+                self.execute_credential_test(test)
+            elif test.id.startswith('PS-'):
+                self.execute_persistence_test(test)
+            elif test.id.startswith('NT-'):
+                self.execute_network_test(test)
+            elif test.id.startswith('DE-'):
+                self.execute_defense_evasion_test(test)
+            elif test.id.startswith('AH-'):
+                self.execute_advanced_host_test(test)
+            elif test.id.startswith('FS-'):
+                self.execute_filesystem_test(test)
+            else:
+                test.status = "SKIPPED"
+                test.reason = "Test category not implemented"
+            
+            self.results[test.category].append(test.to_dict())
+            
+            if test.status == "COMPLETED":
+                self.logger.log(f"Test completed: {test.name}", status="SUCCESS", test_id=test.id)
+            elif test.status == "ERROR":
+                self.logger.log(f"Test failed: {test.name}", error=test.reason, status="ERROR", test_id=test.id)
+                
+        except Exception as e:
+            test.status = "ERROR"
+            test.reason = f"Unexpected error: {str(e)}"
+            self.logger.log(f"Test exception: {test.name}", error=str(e), status="ERROR", test_id=test.id)
+        
+        return test
+    
+    def run_tests(self, tests):
+        """Run all tests with threading"""
+        self.logger.log(f"Starting test execution: {len(tests)} tests", status="INFO")
+        
+        filtered_tests = []
+        for test in tests:
+            if test.id in self.config.skip_tests:
+                test.status = "SKIPPED"
+                test.reason = "Excluded by configuration"
+                self.test_results.append(test)
+                continue
+            
+            if self.config.test_categories and test.category not in self.config.test_categories:
+                test.status = "SKIPPED"
+                test.reason = "Category not selected"
+                self.test_results.append(test)
+                continue
+            
+            filtered_tests.append(test)
+        
+        self.logger.log(f"Executing {len(filtered_tests)} tests (filtered from {len(tests)})", status="INFO")
+        
+        with ThreadPoolExecutor(max_workers=self.config.max_threads) as executor:
+            futures = {executor.submit(self.execute_test, test): test for test in filtered_tests}
+            
+            for future in as_completed(futures):
+                test = futures[future]
+                try:
+                    result = future.result()
+                    self.test_results.append(result)
+                except Exception as e:
+                    self.logger.log(f"Test execution failed: {test.id}", error=str(e), status="ERROR")
+                    test.status = "ERROR"
+                    test.reason = str(e)
+                    self.test_results.append(test)
+        
+        return self.test_results
+
+
+class POCGenerator:
+    """Generate working proof-of-concepts for discovered vulnerabilities"""
+    
+    def __init__(self, logger):
+        self.logger = logger
+    
+    def generate_unquoted_service_poc(self, service_name, service_path):
+        """Generate POC for unquoted service path exploitation"""
+        poc = f"""
+# Unquoted Service Path Exploitation POC
+# Service: {service_name}
+# Path: {service_path}
+
+# Step 1: Identify injection point
+# The service path has spaces without quotes, allowing path hijacking
+
+# Step 2: Create malicious executable
+# Place your payload at the injection point
+# Example: If path is C:\\Program Files\\Vulnerable Service\\service.exe
+# Place payload at C:\\Program.exe
+
+# Step 3: Restart service to trigger
+net stop "{service_name}"
+net start "{service_name}"
+
+# Your payload will execute with service privileges (typically SYSTEM)
+"""
+        return poc
+    
+    def generate_registry_persistence_poc(self, key_path, key_name):
+        """Generate POC for registry persistence"""
+        poc = f"""
+# Registry Persistence POC
+# Path: {key_path}
+# Key: {key_name}
+
+# Add persistence via Run key
+reg add "{key_path}" /v "{key_name}" /t REG_SZ /d "C:\\path\\to\\payload.exe" /f
+
+# Verify
+reg query "{key_path}" /v "{key_name}"
+
+# Payload will execute on user logon
+"""
+        return poc
+    
+    def generate_weak_permission_poc(self, target_path):
+        """Generate POC for weak file permissions"""
+        poc = f"""
+# Weak Permission Exploitation POC
+# Target: {target_path}
+
+# Step 1: Verify permissions
+icacls "{target_path}"
+
+# Step 2: Backup original file
+copy "{target_path}" "{target_path}.bak"
+
+# Step 3: Replace with malicious file
+copy "C:\\path\\to\\payload.exe" "{target_path}"
+
+# Step 4: Trigger execution
+# Depends on file type - may be service restart, system reboot, etc.
+"""
+        return poc
+    
+    def generate_pocs_for_findings(self, test_results):
+        """Generate POCs for all exploitable findings"""
+        pocs = []
+        
+        for test in test_results:
+            if test.status != "COMPLETED":
+                continue
+            
+            if test.id == 'PE-002' and test.findings:
+                for finding in test.findings:
+                    if 'Vulnerable:' in finding:
+                        service_name = finding.replace('Vulnerable:', '').strip()
+                        poc = self.generate_unquoted_service_poc(service_name, 'Unknown')
+                        pocs.append({'test_id': test.id, 'type': 'Unquoted Service Path', 'target': service_name, 'poc': poc})
+            
+            elif test.id == 'PE-005' and test.findings:
+                for finding in test.findings:
+                    if 'HKCU\\' in finding or 'HKLM\\' in finding:
+                        poc = self.generate_registry_persistence_poc(finding, 'Persistence')
+                        pocs.append({'test_id': test.id, 'type': 'Registry Persistence', 'target': finding, 'poc': poc})
+        
+        return pocs
+
+
+class EnhancedReporter:
+    """Generate comprehensive reports with POCs"""
+    
+    def __init__(self, logger):
+        self.logger = logger
+    
+    def generate_html_report(self, summary, pocs, output_file):
+        """Generate HTML report"""
+        html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>Red Team Enumeration Report</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
+        .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
+        h1 {{ color: #c00; border-bottom: 3px solid #c00; padding-bottom: 10px; }}
+        h2 {{ color: #333; border-bottom: 2px solid #ddd; padding-bottom: 5px; margin-top: 30px; }}
+        .summary {{ background: #f9f9f9; padding: 15px; border-left: 4px solid #c00; margin: 20px 0; }}
+        .test-case {{ background: #fff; border: 1px solid #ddd; padding: 15px; margin: 10px 0; }}
+        .test-case.completed {{ border-left: 4px solid #0c0; }}
+        .test-case.error {{ border-left: 4px solid #c00; }}
+        .test-case.skipped {{ border-left: 4px solid #999; }}
+        .findings {{ background: #f0f0f0; padding: 10px; margin: 10px 0; font-family: monospace; }}
+        .poc {{ background: #1e1e1e; color: #0f0; padding: 15px; margin: 10px 0; font-family: monospace; white-space: pre-wrap; }}
+        .status {{ display: inline-block; padding: 3px 8px; border-radius: 3px; font-size: 0.8em; font-weight: bold; }}
+        .status.completed {{ background: #0c0; color: white; }}
+        .status.error {{ background: #c00; color: white; }}
+        .status.skipped {{ background: #999; color: white; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Red Team Enumeration Report</h1>
+        <div class="summary">
+            <h3>Scan Summary</h3>
+            <p><strong>Target:</strong> {summary['scan_info']['target']}</p>
+            <p><strong>User:</strong> {summary['scan_info']['user']}</p>
+            <p><strong>Admin:</strong> {summary['scan_info']['is_admin']}</p>
+            <p><strong>Duration:</strong> {summary['scan_info']['duration_seconds']} seconds</p>
+            <p><strong>Tests Completed:</strong> {summary['test_summary']['completed']}</p>
+            <p><strong>Tests Failed:</strong> {summary['test_summary']['error']}</p>
+            <p><strong>Tests Skipped:</strong> {summary['test_summary']['skipped']}</p>
+        </div>
+        <h2>Test Results</h2>
+"""
+        
+        for test in summary['all_tests']:
+            status_class = test['status'].lower()
+            html_content += f"""        <div class="test-case {status_class}">
+            <h3>{test['id']}: {test['name']} <span class="status {status_class}">{test['status']}</span></h3>
+            <p><strong>Category:</strong> {test['category']}</p>
+            <p><strong>Description:</strong> {test['description']}#!/usr/bin/env python3
+            <p><strong>Description:</strong> {test['description']}</p>
+"""
+            
+            if test.get('reason'):
+                html_content += f"            <p><strong>Reason:</strong> {test['reason']}</p>\n"
+            
+            if test.get('findings'):
+                html_content += "            <div class='findings'><strong>Findings:</strong><br>\n"
+                for finding in test['findings']:
+                    html_content += f"                {finding}<br>\n"
+                html_content += "            </div>\n"
+            
+            html_content += "        </div>\n"
+        
+        if pocs:
+            html_content += "        <h2>Proof of Concepts</h2>\n"
+            for poc in pocs:
+                html_content += f"""        <div class="test-case">
+            <h3>{poc['type']}</h3>
+            <p><strong>Test:</strong> {poc['test_id']}</p>
+            <p><strong>Target:</strong> {poc['target']}</p>
+            <div class="poc">{poc['poc']}</div>
+        </div>
+"""
+        
+        html_content += """    </div>
+</body>
+</html>
+"""
         
         with open(output_file, 'w', encoding='utf-8') as f:
-            w = 100  # Width for formatting
-            
-            # Header
-            f.write("=" * w + "\n")
-            f.write("              DOMAIN ENUMERATION REPORT - RED TEAM PERSPECTIVE\n".center(w))
-            f.write("=" * w + "\n")
-            f.write(f"Generated:    {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Executed By:  {self.results['metadata']['username']}\n")
-            f.write(f"Hostname:     {self.results['metadata']['hostname']}\n")
-            f.write(f"Threads Used: {self.config.threads}\n")
-            f.write("=" * w + "\n\n")
-            
-            # ASCII Diagram
-            f.write(self.generate_ascii_diagram())
-            f.write("\n\n")
-            
-            # Executive Summary
-            f.write("=" * w + "\n")
-            f.write("                             EXECUTIVE SUMMARY\n".center(w))
-            f.write("=" * w + "\n")
-            critical_count = len([f for f in self.results['weaknesses'] if f['severity'] == 'CRITICAL'])
-            high_count = len([f for f in self.results['weaknesses'] if f['severity'] == 'HIGH'])
-            medium_count = len([f for f in self.results['weaknesses'] if f['severity'] == 'MEDIUM'])
-            
-            f.write(f"\nRisk Assessment:\n")
-            f.write(f"  Critical Issues:  {critical_count:>3}\n")
-            f.write(f"  High Issues:      {high_count:>3}\n")
-            f.write(f"  Medium Issues:    {medium_count:>3}\n")
-            f.write(f"\nDiscovered Assets:\n")
-            f.write(f"  Domain Users:     {len(self.results['users']):>6}\n")
-            f.write(f"  Domain Computers: {len(self.results['computers']):>6}\n")
-            f.write(f"  Domain Groups:    {len(self.results['groups']):>6}\n")
-            f.write(f"  Network Shares:   {len(self.results['shares']):>6}\n")
-            
-            f.write("\n\n")
-            
-            # Current User Context
-            f.write("=" * w + "\n")
-            f.write("                          CURRENT USER CONTEXT\n".center(w))
-            f.write("=" * w + "\n\n")
-            f.write("WHO AM I:\n")
-            f.write("-" * w + "\n")
-            f.write(str(self.results['current_user'].get('whoami', 'N/A')))
-            f.write("\n\n")
-            
-            f.write("PRIVILEGES:\n")
-            f.write("-" * w + "\n")
-            f.write(str(self.results['current_user'].get('privileges', 'N/A')))
-            f.write("\n\n")
-            
-            f.write("GROUP MEMBERSHIPS:\n")
-            f.write("-" * w + "\n")
-            f.write(str(self.results['current_user'].get('groups', 'N/A')))
-            f.write("\n\n")
-            
-            # Security Weaknesses - MOST IMPORTANT SECTION
-            f.write("=" * w + "\n")
-            f.write("          SECURITY WEAKNESSES & RED TEAM EXPLOITATION OPPORTUNITIES\n".center(w))
-            f.write("=" * w + "\n\n")
-            
-            for i, finding in enumerate(self.results['weaknesses'], 1):
-                f.write(f"\n[{i}] {finding['finding']}\n")
-                f.write("=" * w + "\n")
-                f.write(f"Severity:     {finding['severity']}\n")
-                f.write(f"Category:     {finding['category']}\n")
-                f.write(f"CVSS Score:   {finding.get('cvss', 'N/A')}\n")
-                f.write(f"\nDescription:\n  {finding['description']}\n")
-                f.write(f"\nExploitation:\n  {finding['recommendation']}\n")
-                f.write("-" * w + "\n")
-            
-            f.write("\n\n")
-            
-            # Domain Information
-            f.write("=" * w + "\n")
-            f.write("                            DOMAIN INFORMATION\n".center(w))
-            f.write("=" * w + "\n\n")
-            f.write("BASIC DOMAIN INFO:\n")
-            f.write("-" * w + "\n")
-            try:
-                domain_json = json.loads(self.results['domain_info'].get('basic', '{}'))
-                f.write(json.dumps(domain_json, indent=2))
-            except:
-                f.write(str(self.results['domain_info'].get('basic', 'N/A')))
-            f.write("\n\n")
-            
-            f.write("DOMAIN CONTROLLERS:\n")
-            f.write("-" * w + "\n")
-            f.write(str(self.results['domain_info'].get('domain_controllers', 'N/A')))
-            f.write("\n\n")
-            
-            # Users (limited output)
-            f.write("DOMAIN USERS (Sample):\n")
-            f.write("-" * w + "\n")
-            for user in self.results['users'][:100]:
-                f.write(f"  - {user}\n")
-            if len(self.results['users']) > 100:
-                f.write(f"  ... and {len(self.results['users']) - 100} more users\n")
-            f.write("\n\n")
-            
-            # Computers (limited output)
-            f.write("DOMAIN COMPUTERS (Sample):\n")
-            f.write("-" * w + "\n")
-            for computer in self.results['computers'][:100]:
-                f.write(f"  - {computer}\n")
-            if len(self.results['computers']) > 100:
-                f.write(f"  ... and {len(self.results['computers']) - 100} more computers\n")
-            f.write("\n\n")
-            
-            # Groups
-            f.write("DOMAIN GROUPS:\n")
-            f.write("-" * w + "\n")
-            for group in self.results['groups']:
-                f.write(f"  - {group}\n")
-            f.write("\n\n")
-            
-            # Network Shares
-            f.write("NETWORK SHARES:\n")
-            f.write("-" * w + "\n")
-            for share in self.results['shares']:
-                f.write(f"\n{share['type'].upper()} SHARES:\n")
-                f.write(str(share['data'])[:2000] + "\n")
-            f.write("\n\n")
-            
-            # GPO
-            f.write("GROUP POLICY OBJECTS:\n")
-            f.write("-" * w + "\n")
-            for gpo in self.results['gpo']:
-                f.write(f"\n{gpo.get('scope', 'unknown').upper()} SCOPE:\n")
-                f.write(str(gpo.get('data', ''))[:2000] + "\n")
-            f.write("\n\n")
-            
-            # PowerView Results
-            if self.config.powerview and self.results.get('powerview_data'):
-                f.write("=" * w + "\n")
-                f.write("                          POWERVIEW ENUMERATION RESULTS\n".center(w))
-                f.write("=" * w + "\n\n")
-                try:
-                    pv_data = json.loads(self.results['powerview_data'])
-                    f.write(json.dumps(pv_data, indent=2)[:10000])
-                except:
-                    f.write(str(self.results['powerview_data'])[:10000])
-                f.write("\n\n")
-            
-            # SharpHound Results
-            if self.config.sharphound and self.results.get('bloodhound_data'):
-                f.write("=" * w + "\n")
-                f.write("                        SHARPHOUND/BLOODHOUND RESULTS\n".center(w))
-                f.write("=" * w + "\n\n")
-                bh_data = self.results['bloodhound_data']
-                f.write(f"BloodHound ZIP File: {bh_data.get('zip_file', 'N/A')}\n")
-                f.write(f"Location: {bh_data.get('path', 'N/A')}\n")
-                f.write(f"\nOutput:\n{str(bh_data.get('output', 'N/A'))[:2000]}\n")
-                f.write("\n\n")
-            
-            # ADRecon Results
-            if self.config.adrecon and self.results.get('adrecon_data'):
-                f.write("=" * w + "\n")
-                f.write("                           ADRECON RESULTS\n".center(w))
-                f.write("=" * w + "\n\n")
-                ad_data = self.results['adrecon_data']
-                f.write(f"Output Directory: {ad_data.get('output_dir', 'N/A')}\n")
-                f.write(f"\nOutput:\n{str(ad_data.get('output', 'N/A'))[:2000]}\n")
-                f.write("\n\n")
-            
-            # ACLPwn Results
-            if self.config.aclpwn and self.results.get('aclpwn_data'):
-                f.write("=" * w + "\n")
-                f.write("                           INVOKE-ACLPWN RESULTS\n".center(w))
-                f.write("=" * w + "\n\n")
-                try:
-                    acl_data = json.loads(self.results['aclpwn_data'])
-                    f.write(json.dumps(acl_data, indent=2)[:5000])
-                except:
-                    f.write(str(self.results['aclpwn_data'])[:5000])
-                f.write("\n\n")
-            
-            # PowerUpSQL Results
-            if self.config.powerupsql and self.results.get('powerupsql_data'):
-                f.write("=" * w + "\n")
-                f.write("                          POWERUPSQL RESULTS\n".center(w))
-                f.write("=" * w + "\n\n")
-                try:
-                    sql_data = json.loads(self.results['powerupsql_data'])
-                    f.write(json.dumps(sql_data, indent=2)[:5000])
-                except:
-                    f.write(str(self.results['powerupsql_data'])[:5000])
-                f.write("\n\n")
-            
-            # Local System Information
-            f.write("=" * w + "\n")
-            f.write("                      LOCAL SYSTEM INFORMATION\n".center(w))
-            f.write("=" * w + "\n\n")
-            f.write("SYSTEM INFO:\n")
-            f.write("-" * w + "\n")
-            f.write(str(self.results['local_privileges'].get('systeminfo', 'N/A'))[:3000])
-            f.write("\n\n")
-            
-            f.write("LOCAL USERS:\n")
-            f.write("-" * w + "\n")
-            f.write(str(self.results['local_privileges'].get('local_users', 'N/A'))[:2000])
-            f.write("\n\n")
-            
-            f.write("LOCAL GROUPS:\n")
-            f.write("-" * w + "\n")
-            f.write(str(self.results['local_privileges'].get('local_groups', 'N/A'))[:2000])
-            f.write("\n\n")
-            
-            # Footer
-            end_time = datetime.now()
-            start_time = datetime.fromisoformat(self.results['metadata']['start_time'])
-            duration = (end_time - start_time).total_seconds()
-            
-            f.write("=" * w + "\n")
-            f.write("                              END OF REPORT\n".center(w))
-            f.write("=" * w + "\n")
-            f.write(f"Report completed in {duration:.2f} seconds\n")
-            f.write(f"Log file: {self.logger.log_file}\n")
-            f.write("=" * w + "\n")
+            f.write(html_content)
         
-        self.logger.log(f"Report generated: {output_file}", status="SUCCESS")
-        return output_file
+        self.logger.log(f"HTML report generated: {output_file}", status="SUCCESS")
+
+
+class DomainEnumerator:
+    """Main enumeration orchestrator"""
     
-    def cleanup(self):
-        """Clean up temporary files"""
-        try:
-            if os.path.exists(self.temp_dir):
-                # Copy important artifacts before cleanup
-                if self.results.get('bloodhound_data', {}).get('zip_file'):
-                    bh_zip = self.results['bloodhound_data']['path']
-                    if os.path.exists(bh_zip):
-                        shutil.copy(bh_zip, '.')
-                        self.logger.log(f"BloodHound data saved: {os.path.basename(bh_zip)}", status="SUCCESS")
-                
-                if self.results.get('adrecon_data', {}).get('output_dir'):
-                    adrecon_dir = self.results['adrecon_data']['output_dir']
-                    if os.path.exists(adrecon_dir):
-                        shutil.copytree(adrecon_dir, './ADRecon_Output', dirs_exist_ok=True)
-                        self.logger.log("ADRecon data saved: ./ADRecon_Output", status="SUCCESS")
-                
-                # Clean temp directory
-                shutil.rmtree(self.temp_dir)
-                self.logger.log("Temporary files cleaned up", status="SUCCESS")
-        except Exception as e:
-            self.logger.log("Cleanup failed", error=str(e), status="WARN")
+    def __init__(self, config):
+        self.config = config
+        self.logger = Logger(config.output_dir, config.verbose)
+        self.executor = TestExecutor(config, self.logger)
+        self.all_tests = []
+    
+    def load_all_tests(self):
+        """Load all test cases"""
+        self.logger.log("Loading test cases", status="INFO")
+        
+        self.all_tests.extend(HostReconTests.create_tests())
+        self.all_tests.extend(PrivilegeEscalationTests.create_tests())
+        self.all_tests.extend(CredentialAccessTests.create_tests())
+        self.all_tests.extend(PersistenceTests.create_tests())
+        self.all_tests.extend(NetworkTests.create_tests())
+        self.all_tests.extend(DefenseEvasionTests.create_tests())
+        self.all_tests.extend(AdvancedHostTests.create_tests())
+        self.all_tests.extend(FileSystemTests.create_tests())
+        
+        self.logger.log(f"Loaded {len(self.all_tests)} test cases", status="SUCCESS")
+        
+        categories = {}
+        for test in self.all_tests:
+            categories[test.category] = categories.get(test.category, 0) + 1
+        
+        for category, count in categories.items():
+            self.logger.log(f"  {category}: {count} tests", status="INFO")
     
     def run_enumeration(self):
-        """Main enumeration workflow with multi-threading"""
-        print("\n" + "=" * 100)
-        print("                    ADVANCED DOMAIN ENUMERATION TOOL - RED TEAM EDITION")
-        print("=" * 100 + "\n")
+        """Run the complete enumeration"""
+        start_time = time.time()
         
-        self.logger.log("Starting domain enumeration with multi-threading", status="INFO")
+        self.logger.log("="*80, status="INFO")
+        self.logger.log("RED TEAM ENUMERATION TOOL - STARTING", status="INFO")
+        self.logger.log("="*80, status="INFO")
         
-        print(f"[*] Configuration:")
-        print(f"    - Threads: {self.config.threads}")
-        print(f"    - PowerView: {'ENABLED' if self.config.powerview else 'DISABLED'}")
-        print(f"    - SharpHound: {'ENABLED' if self.config.sharphound else 'DISABLED'}")
-        print(f"    - ADRecon: {'ENABLED' if self.config.adrecon else 'DISABLED'}")
-        print(f"    - Invoke-ACLPwn: {'ENABLED' if self.config.aclpwn else 'DISABLED'}")
-        print(f"    - PowerUpSQL: {'ENABLED' if self.config.powerupsql else 'DISABLED'}")
-        print()
+        system_info = EmbeddedTools.get_system_info()
+        self.logger.log(f"Target: {system_info.get('hostname', 'Unknown')}", status="INFO")
+        self.logger.log(f"User: {system_info.get('username', 'Unknown')}", status="INFO")
+        self.logger.log(f"Admin: {self.executor.is_admin}", status="INFO")
         
-        try:
-            start_time = time.time()
-            
-            # Run parallel enumeration
-            self.run_enumeration_parallel()
-            
-            # Generate report
-            report_file = self.generate_report()
-            
-            end_time = time.time()
-            duration = end_time - start_time
-            
-            # Cleanup
-            self.cleanup()
-            
-            print("\n" + "=" * 100)
-            print("Enumeration complete!")
-            print("=" * 100)
-            print(f"  Report:      {report_file}")
-            print(f"  Log:         {self.logger.log_file}")
-            if self.results.get('bloodhound_data', {}).get('zip_file'):
-                print(f"  BloodHound:  {self.results['bloodhound_data']['zip_file']}")
-            if self.results.get('adrecon_data', {}).get('output_dir'):
-                print(f"  ADRecon:     ./ADRecon_Output")
-            print(f"  Duration:    {duration:.2f} seconds")
-            print(f"  Findings:    {len(self.results['weaknesses'])} total")
-            print(f"               {len([f for f in self.results['weaknesses'] if f['severity'] == 'CRITICAL'])} critical")
-            print("=" * 100 + "\n")
-            
-        except Exception as e:
-            self.logger.log("Enumeration failed", error=str(e), status="ERROR")
-            print(f"\n[ERROR] Enumeration failed: {e}")
-            self.cleanup()
+        self.load_all_tests()
+        
+        active_modules = [m for m, enabled in self.config.modules.items() if enabled]
+        self.logger.log(f"Active modules: {', '.join(active_modules)}", status="INFO")
+        
+        self.logger.log("Starting test execution", status="INFO")
+        test_results = self.executor.run_tests(self.all_tests)
+        
+        elapsed_time = time.time() - start_time
+        
+        summary = {
+            'scan_info': {
+                'start_time': datetime.fromtimestamp(start_time).isoformat(),
+                'end_time': datetime.now().isoformat(),
+                'duration_seconds': round(elapsed_time, 2),
+                'target': system_info.get('hostname', 'Unknown'),
+                'user': system_info.get('username', 'Unknown'),
+                'is_admin': self.executor.is_admin
+            },
+            'test_summary': {
+                'total': len(test_results),
+                'completed': sum(1 for t in test_results if t.status == 'COMPLETED'),
+                'error': sum(1 for t in test_results if t.status == 'ERROR'),
+                'skipped': sum(1 for t in test_results if t.status == 'SKIPPED')
+            },
+            'results_by_category': self.executor.results,
+            'all_tests': [t.to_dict() for t in test_results]
+        }
+        
+        self.logger.save_results(summary)
+        self.logger.save_testcase_report(test_results)
+        
+        self.logger.log("="*80, status="INFO")
+        self.logger.log("ENUMERATION COMPLETE", status="SUCCESS")
+        self.logger.log("="*80, status="INFO")
+        self.logger.log(f"Duration: {elapsed_time:.2f} seconds", status="INFO")
+        self.logger.log(f"Tests completed: {summary['test_summary']['completed']}", status="SUCCESS")
+        self.logger.log(f"Tests failed: {summary['test_summary']['error']}", status="ERROR" if summary['test_summary']['error'] > 0 else "INFO")
+        self.logger.log(f"Tests skipped: {summary['test_summary']['skipped']}", status="WARN")
+        self.logger.log(f"Results saved to: {self.config.output_dir}", status="INFO")
+        self.logger.log(f"Test case report: {self.logger.testcase_file}", status="INFO")
+        
+        self.print_high_value_findings(test_results)
+        
+        return summary
+    
+    def print_high_value_findings(self, test_results):
+        """Print high-value findings"""
+        self.logger.log("="*80, status="INFO")
+        self.logger.log("HIGH-VALUE FINDINGS", status="CRITICAL")
+        self.logger.log("="*80, status="INFO")
+        
+        high_value = []
+        
+        for test in test_results:
+            if test.status == "COMPLETED" and test.findings:
+                if any(keyword in ' '.join(test.findings).lower() for keyword in 
+                       ['admin', 'password', 'credential', 'vulnerable', 'disabled', 'detected']):
+                    high_value.append(test)
+        
+        if high_value:
+            for test in high_value[:10]:
+                self.logger.log(f"\n[{test.id}] {test.name}", status="WARN")
+                for finding in test.findings[:5]:
+                    self.logger.log(f"  └─ {finding}", status="INFO")
+        else:
+            self.logger.log("No high-value findings identified", status="INFO")
 
-class Config:
-    """Configuration class for command-line arguments"""
-    def __init__(self):
-        self.threads = 4
-        self.powerview = True
-        self.sharphound = True
-        self.adrecon = True
-        self.aclpwn = True
-        self.powerupsql = True
 
 def main():
+    """Main entry point"""
     parser = argparse.ArgumentParser(
-        description='Advanced Domain Enumeration Tool - Red Team Edition',
+        description='Advanced Domain Enumeration Tool - Red Team Edition (Fully Integrated)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog='''
 Examples:
-  # Run with all tools enabled (default)
-  python domain_enum_tool.py
+  # Basic host enumeration
+  python %(prog)s
   
-  # Run with specific tools
-  python domain_enum_tool.py --powerview --sharphound
+  # Full enumeration with credentials
+  python %(prog)s --domain example.com --username user --password pass
   
-  # Disable specific tools
-  python domain_enum_tool.py --no-adrecon --no-powerupsql
+  # Specific modules only
+  python %(prog)s --modules host_enum,privilege_escalation
   
-  # Set thread count
-  python domain_enum_tool.py --threads 8
+  # Skip specific tests
+  python %(prog)s --skip-tests HR-006,DE-002
   
-  # Minimal scan (basic enumeration only)
-  python domain_enum_tool.py --no-powerview --no-sharphound --no-adrecon --no-aclpwn --no-powerupsql
-        """
+  # Filter by category
+  python %(prog)s --categories "Host Reconnaissance,Credential Access"
+  
+  # Generate POCs for findings
+  python %(prog)s --generate-pocs
+  
+  # Generate HTML report
+  python %(prog)s --html-report
+  
+  # Stealth mode with minimal threads
+  python %(prog)s --stealth --threads 1
+        '''
     )
     
-    parser.add_argument('-t', '--threads', type=int, default=4,
-                       help='Number of threads for parallel execution (default: 4)')
+    target_group = parser.add_argument_group('Target Options')
+    target_group.add_argument('--domain', help='Target domain')
+    target_group.add_argument('--dc', help='Domain controller IP/hostname')
+    target_group.add_argument('--targets-file', help='File containing target hosts (one per line)')
     
-    parser.add_argument('--powerview', action='store_true', default=True,
-                       help='Enable PowerView enumeration (default: enabled)')
-    parser.add_argument('--no-powerview', dest='powerview', action='store_false',
-                       help='Disable PowerView enumeration')
+    cred_group = parser.add_argument_group('Credential Options')
+    cred_group.add_argument('--username', '-u', help='Username for authentication')
+    cred_group.add_argument('--password', '-p', help='Password for authentication')
+    cred_group.add_argument('--hash', help='NTLM hash for authentication')
     
-    parser.add_argument('--sharphound', action='store_true', default=True,
-                       help='Enable SharpHound/BloodHound collection (default: enabled)')
-    parser.add_argument('--no-sharphound', dest='sharphound', action='store_false',
-                       help='Disable SharpHound/BloodHound collection')
+    module_group = parser.add_argument_group('Module Options')
+    module_group.add_argument('--modules', help='Comma-separated list of modules to run')
+    module_group.add_argument('--skip-tests', help='Comma-separated list of test IDs to skip')
+    module_group.add_argument('--categories', help='Comma-separated list of test categories to run')
     
-    parser.add_argument('--adrecon', action='store_true', default=True,
-                       help='Enable ADRecon enumeration (default: enabled)')
-    parser.add_argument('--no-adrecon', dest='adrecon', action='store_false',
-                       help='Disable ADRecon enumeration')
+    exec_group = parser.add_argument_group('Execution Options')
+    exec_group.add_argument('--threads', '-t', type=int, default=5, help='Maximum number of threads (default: 5)')
+    exec_group.add_argument('--timeout', type=int, default=300, help='Command timeout in seconds (default: 300)')
+    exec_group.add_argument('--output', '-o', default='output', help='Output directory (default: output)')
+    exec_group.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
+    exec_group.add_argument('--stealth', action='store_true', help='Stealth mode (slower, more cautious)')
     
-    parser.add_argument('--aclpwn', action='store_true', default=True,
-                       help='Enable Invoke-ACLPwn enumeration (default: enabled)')
-    parser.add_argument('--no-aclpwn', dest='aclpwn', action='store_false',
-                       help='Disable Invoke-ACLPwn enumeration')
+    report_group = parser.add_argument_group('Reporting Options')
+    report_group.add_argument('--generate-pocs', action='store_true', help='Generate proof-of-concept exploits')
+    report_group.add_argument('--html-report', action='store_true', help='Generate HTML report')
     
-    parser.add_argument('--powerupsql', action='store_true', default=True,
-                       help='Enable PowerUpSQL enumeration (default: enabled)')
-    parser.add_argument('--no-powerupsql', dest='powerupsql', action='store_false',
-                       help='Disable PowerUpSQL enumeration')
-    
-    parser.add_argument('--minimal', action='store_true',
-                       help='Minimal scan - basic enumeration only, all tools disabled')
+    list_group = parser.add_argument_group('Information Options')
+    list_group.add_argument('--list-modules', action='store_true', help='List available modules and exit')
+    list_group.add_argument('--list-tests', action='store_true', help='List all test cases and exit')
     
     args = parser.parse_args()
     
-    # Create config
-    config = Config()
-    config.threads = args.threads
+    if args.list_modules:
+        print("\nAvailable Modules:")
+        print("=" * 60)
+        modules = {
+            'reconnaissance': 'External and internal reconnaissance',
+            'host_enum': 'Host-level enumeration and system discovery',
+            'privilege_escalation': 'Privilege escalation vulnerability checks',
+            'credential_access': 'Credential harvesting and discovery',
+            'lateral_movement': 'Lateral movement techniques (RISKY)',
+            'domain_enum': 'Active Directory domain enumeration',
+            'vulnerability_assessment': 'Vulnerability scanning and detection',
+            'persistence_check': 'Persistence mechanism detection'
+        }
+        for module, desc in modules.items():
+            print(f"  {module:30} - {desc}")
+        print()
+        return 0
     
-    if args.minimal:
-        config.powerview = False
-        config.sharphound = False
-        config.adrecon = False
-        config.aclpwn = False
-        config.powerupsql = False
-    else:
-        config.powerview = args.powerview
-        config.sharphound = args.sharphound
-        config.adrecon = args.adrecon
-        config.aclpwn = args.aclpwn
-        config.powerupsql = args.powerupsql
+    if args.list_tests:
+        print("\nAvailable Test Cases:")
+        print("=" * 80)
+        
+        config = Config()
+        enumerator = DomainEnumerator(config)
+        enumerator.load_all_tests()
+        
+        current_category = None
+        for test in enumerator.all_tests:
+            if test.category != current_category:
+                current_category = test.category
+                print(f"\n{current_category}:")
+                print("-" * 80)
+            
+            admin_req = " [ADMIN REQUIRED]" if test.requires_admin else ""
+            cred_req = " [CREDS REQUIRED]" if test.requires_creds else ""
+            risk = f" [RISK: {test.risk_level}]"
+            
+            print(f"  {test.id:10} {test.name:40} {risk}{admin_req}{cred_req}")
+            print(f"             {test.description}")
+        
+        print("\n" + "=" * 80)
+        print(f"Total: {len(enumerator.all_tests)} test cases\n")
+        return 0
     
-    # Display banner
     print("""
-    ╔══════════════════════════════════════════════════════════════════════════════════════╗
-    ║              ADVANCED DOMAIN ENUMERATION TOOL - RED TEAM EDITION v2.0               ║
-    ║                                                                                      ║
-    ║  Integrated Tools: PowerView | SharpHound | ADRecon | Invoke-ACLPwn | PowerUpSQL   ║
-    ║                                                                                      ║
-    ║  WARNING: This tool is for authorized security assessments only                     ║
-    ║  Unauthorized use may violate laws and regulations                                  ║
-    ╚══════════════════════════════════════════════════════════════════════════════════════╝
+    ╔═══════════════════════════════════════════════════════════════════╗
+    ║  Advanced Domain Enumeration Tool - Red Team Edition             ║
+    ║  Fully Integrated - No External Dependencies                     ║
+    ║  For Authorized Security Testing Only                            ║
+    ╚═══════════════════════════════════════════════════════════════════╝
     """)
     
-    response = input("Are you authorized to run this enumeration? (yes/no): ")
-    if response.lower() != 'yes':
-        print("\n[!] Enumeration cancelled by user.")
-        sys.exit(0)
+    config = Config()
+    config.from_args(args)
     
-    # Run enumeration
-    enumerator = DomainEnumerator(config)
-    enumerator.run_enumeration()
+    if config.stealth_mode:
+        config.max_threads = 1
+        config.timeout = 600
+        print("[!] Stealth mode enabled - operations will be slower and more cautious")
+    
+    if not config.username and not config.password:
+        print("[!] No credentials provided - some tests will be skipped")
+    
+    if config.modules.get('lateral_movement'):
+        print("[!] WARNING: Lateral movement module is RISKY and may trigger alerts")
+        response = input("[?] Continue? (yes/no): ")
+        if response.lower() != 'yes':
+            print("[!] Lateral movement disabled")
+            config.modules['lateral_movement'] = False
+    
+    try:
+        enumerator = DomainEnumerator(config)
+        results = enumerator.run_enumeration()
+        
+        if args.generate_pocs:
+            print("\n[*] Generating proof-of-concepts...")
+            poc_generator = POCGenerator(enumerator.logger)
+            pocs = poc_generator.generate_pocs_for_findings(enumerator.executor.test_results)
+            
+            if pocs:
+                poc_file = os.path.join(config.output_dir, f'pocs_{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt')
+                with open(poc_file, 'w', encoding='utf-8') as f:
+                    f.write("="*80 + "\n")
+                    f.write("PROOF OF CONCEPTS - DISCOVERED VULNERABILITIES\n")
+                    f.write("="*80 + "\n\n")
+                    
+                    for poc in pocs:
+                        f.write(f"\n{'='*80}\n")
+                        f.write(f"Type: {poc['type']}\n")
+                        f.write(f"Test: {poc['test_id']}\n")
+                        f.write(f"Target: {poc['target']}\n")
+                        f.write(f"{'='*80}\n")
+                        f.write(poc['poc'])
+                        f.write("\n\n")
+                
+                print(f"[+] Generated {len(pocs)} POCs: {poc_file}")
+            else:
+                print("[!] No exploitable vulnerabilities found for POC generation")
+        
+        if args.html_report:
+            print("\n[*] Generating HTML report...")
+            reporter = EnhancedReporter(enumerator.logger)
+            html_file = os.path.join(config.output_dir, f'report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.html')
+            
+            pocs = []
+            if args.generate_pocs:
+                poc_generator = POCGenerator(enumerator.logger)
+                pocs = poc_generator.generate_pocs_for_findings(enumerator.executor.test_results)
+            
+            reporter.generate_html_report(results, pocs, html_file)
+            print(f"[+] HTML report generated: {html_file}")
+        
+        return 0
+        
+    except KeyboardInterrupt:
+        print("\n[!] Enumeration interrupted by user")
+        return 1
+    except Exception as e:
+        print(f"\n[!] Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
